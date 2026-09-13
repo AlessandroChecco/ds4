@@ -40399,6 +40399,15 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         minimum = 1024u;
 #endif
     if (remaining < minimum) return 1;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Keep a medium SSD append in one layer sweep without changing its
+     * 2048-row arithmetic partitions. Tiny tails retain the exact row path. */
+    if (g->streaming && g->tp_world == 1 && g->prefill_cap >= 2048u &&
+        g->carry_cap >= remaining &&
+        remaining > 2048u && remaining < 8192u && remaining % 2048u >= 256u &&
+        !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
+        !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
+#endif
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
