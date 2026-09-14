@@ -201,6 +201,18 @@ static void test_session_rewind_replay(void) {
     const int last = replay.v[replay.len - 1];
     ds4_session_rewind(live, replay.len - 1);
     TEST_ASSERT(ds4_session_pos(live) == replay.len - 1);
+    if (mtp) {
+        ds4_session_snapshot rewound = {0};
+        TEST_ASSERT(ds4_session_save_snapshot(live, &rewound, err, sizeof(err)) == 0);
+        if (rewound.ptr) {
+            TEST_ASSERT(ds4_session_load_snapshot(fresh, &rewound, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_eval(fresh, last, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_top_logprobs(fresh, got, 8) == 8);
+            TEST_ASSERT(got[0].id == want[0].id);
+            for (int i = 0; i < 8; i++) TEST_ASSERT(fabsf(got[i].logprob - want[i].logprob) < 2e-3f);
+        }
+        ds4_session_snapshot_free(&rewound);
+    }
     TEST_ASSERT(ds4_session_eval(live, last, err, sizeof(err)) == 0);
     /* Match the replay's prefill/decode split. A full-prefix prefill uses
      * different floating-point accumulation than the final decode step. */
@@ -406,12 +418,93 @@ static void test_qwen_prefill_checkpoints(void) {
         }
         ds4_session_payload_file_free(&capture.payload);
     }
+    /* Rewind outside a speculative snapshot resets the recurrent graph but
+     * retains the transcript. A subsequent sync must replay that prefix,
+     * whether it appends new tokens or requests the retained prefix itself. */
+    for (int append = 0; append < 2; append++) {
+        ds4_tokens target = prompt;
+        target.len = 512;
+        TEST_ASSERT(ds4_session_sync(live, &target, err, sizeof(err)) == 0);
+        ds4_session_rewind(live, 128);
+        target.len = append ? 384 : 128;
+        TEST_ASSERT(ds4_session_sync(live, &target, err, sizeof(err)) == 0);
+        ds4_session_invalidate(reference);
+        TEST_ASSERT(ds4_session_sync(reference, &target, err, sizeof(err)) == 0);
+        test_qwen_prefill_scores_equal(live, reference);
+        const int token = ds4_session_argmax(reference);
+        TEST_ASSERT(ds4_session_eval(live, token, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(reference, token, err, sizeof(err)) == 0);
+        test_qwen_prefill_scores_equal(live, reference);
+    }
 cleanup:
     ds4_session_free(restored);
     ds4_session_free(reference);
     ds4_session_free(live);
     ds4_tokens_free(&prompt);
     test_restore_env("DS4_QWEN4_PREFILL_CHUNK", saved_chunk);
+}
+
+static void test_qwen_restore_reused_session(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_qwen4(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        puts("qwen4-restore-reuse: Qwen3.8 with MTP required, skipped");
+        return;
+    }
+    char *saved_force = test_save_env("DS4_QWEN4_SPEC_FORCE_ACCEPT");
+    setenv("DS4_QWEN4_SPEC_FORCE_ACCEPT", "1", 1);
+    ds4_session *live = NULL, *reference = NULL;
+    ds4_tokens prompt = {0}, other = {0};
+    ds4_session_snapshot snapshot = {0};
+    char err[192] = {0};
+    ds4_encode_chat_prompt(engine, NULL, "Count from one to ten.", DS4_THINK_NONE, &prompt);
+    TEST_ASSERT(ds4_session_create(&live, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&reference, engine, 1024) == 0);
+    if (!live || !reference) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+    for (int step = 0; step < 3; step++) {
+        int accepted[2];
+        int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
+                                                   2, -1, accepted, 2, err, sizeof(err));
+        TEST_ASSERT(n == (step == 0 ? 1 : 2));
+        if (n < 1) goto cleanup;
+    }
+    const ds4_tokens *tokens = ds4_session_tokens(live);
+    for (int i = 0; i < tokens->len; i++) ds4_tokens_push(&other, tokens->v[i]);
+    /* Same positions, different history: the old verifier snapshots must not
+     * survive loading this checkpoint into the already-used session. */
+    other.v[prompt.len / 2] = prompt.v[prompt.len / 2 + 1];
+    TEST_ASSERT(ds4_session_sync(reference, &other, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_save_snapshot(reference, &snapshot, err, sizeof(err)) == 0);
+    if (!snapshot.ptr) goto cleanup;
+    TEST_ASSERT(ds4_session_load_snapshot(live, &snapshot, err, sizeof(err)) == 0);
+    ds4_session_rewind(live, other.len - 1);
+    TEST_ASSERT(ds4_session_eval(live, other.v[other.len - 1], err, sizeof(err)) == 0);
+    ds4_tokens prefix = other;
+    prefix.len--;
+    ds4_session_invalidate(reference);
+    TEST_ASSERT(ds4_session_sync(reference, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(reference, other.v[other.len - 1], err, sizeof(err)) == 0);
+    test_qwen_prefill_scores_equal(live, reference);
+
+    /* A truncated logits read must not leave a sampleable checkpoint. */
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        size_t bytes = 13u * sizeof(uint32_t) + (size_t)other.len * sizeof(uint32_t) + 17u;
+        TEST_ASSERT(bytes < snapshot.len);
+        TEST_ASSERT(fwrite(snapshot.ptr, 1, bytes, fp) == bytes);
+        rewind(fp);
+        TEST_ASSERT(ds4_session_load_payload(live, fp, snapshot.len, err, sizeof(err)) != 0);
+        TEST_ASSERT(ds4_session_argmax(live) == -1);
+        fclose(fp);
+    }
+cleanup:
+    ds4_session_snapshot_free(&snapshot);
+    ds4_tokens_free(&other);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(reference);
+    ds4_session_free(live);
+    test_restore_env("DS4_QWEN4_SPEC_FORCE_ACCEPT", saved_force);
 }
 
 static void test_session_snapshot_roundtrip(void) {
@@ -6752,7 +6845,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
         &turn->content,
         &turn->reasoning,
         &turn->calls,
-        &recovered);
+        &recovered, &r->tool_orders);
     if (turn->calls.len > 0) turn->finish = "tool_calls";
     if (!parsed) {
         fprintf(stderr,
@@ -7118,6 +7211,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
+    {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},

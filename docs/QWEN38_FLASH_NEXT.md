@@ -105,7 +105,9 @@ the responses and diagnostics for inspection; it does not grade image content.
 Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table.
-Multi-node tensor parallelism is not implemented yet.
+Tensor parallelism, pipeline execution, and SSD expert streaming are not
+implemented for this model yet. CPU code is a correctness reference, not a
+general inference backend.
 
 
 ## Validation
@@ -129,8 +131,13 @@ including cancellation frontiers. To test save/restore and continuation:
 ```sh
 DS4_TEST_MODEL=/path/to/main-with-mtp.gguf DS4_TEST_PLE=/path/to/ple.gguf \
   DS4_TEST_GLM_MTP=1 DS4_TEST_MTP_EXACT=1 \
-  ./ds4_test --qwen4-prefill-checkpoints --session-snapshot --session-rewind-resample
+  ./ds4_test --qwen4-prefill-checkpoints --qwen4-restore-reuse \
+    --session-snapshot --session-rewind --session-rewind-resample
 python3 tests/test_qwen4_checkpoint_replay.py \
+  --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
+python3 tests/test_qwen4_mtp_limits.py \
+  --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
+python3 tests/test_qwen4_logit_dump.py \
   --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
 ```
 
@@ -140,6 +147,12 @@ that omit reasoning and clients that echo `reasoning_content`, including
 server restart after a continuation. For tools-enabled histories, the first
 answer keeps the exact disk key; after a client continues without reasoning,
 the next checkpoint uses the visible history key for restart reuse.
+
+The MTP tests cover small prefill buffers, rewinds, reused sessions, and
+truncated checkpoints. The logit-dump test requires NumPy and compares all-row
+prefill with teacher-forced decode across a chunk boundary. For official
+continuation scoring, pass `--ple` to `score_official`; use `--rendered-prompt`
+when a fixture already contains the complete model chat template.
 
 Qwen directional steering and activation capture support all 48 trunk layers;
 see [directional steering](../dir-steering/README.md). Model-backed regressions:
