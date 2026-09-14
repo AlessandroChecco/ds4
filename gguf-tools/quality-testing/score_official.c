@@ -22,7 +22,7 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-            "[--quality] [--rendered-prompt] "
+            "[--quality] [--rendered-prompt] [--ple FILE] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
@@ -625,6 +625,7 @@ int main(int argc, char **argv) {
     bool ctx_set = false;
     bool quality = false;
     bool rendered_prompt = false;
+    const char *ple_path = NULL;
     const char *gpu_vram_arg = NULL;
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
@@ -665,6 +666,8 @@ int main(int argc, char **argv) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
             rendered_prompt = true;
+        } else if (!strcmp(arg, "--ple")) {
+            ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -723,6 +726,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = model_path,
+        .ple_path = ple_path,
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
@@ -882,20 +886,6 @@ int main(int argc, char **argv) {
         ds4_tokens target = {0};
         if (rendered_prompt) {
             ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
-        } else if (getenv("DS4_SCORE_FIXTURE_RENDER")) {
-            /* qwen38-bf16-reference fixture rendering: the same segmented
-             * chat as DS4_THINK_NONE but with a bare </think>\n\n prefix and
-             * no empty <think>\n\n block (drop the think_start + newline the
-             * branch renderer inserts before think_end). */
-            ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
-            if (prompt.len >= 4 && prompt.v[prompt.len - 3] == 271 /* \n\n */ &&
-                prompt.v[prompt.len - 4] == 248068 /* <think> */ &&
-                prompt.v[prompt.len - 2] == 248069 /* </think> */) {
-                /* [...assistant\n <think> \n\n </think> \n\n] -> [...assistant\n </think> \n\n] */
-                prompt.v[prompt.len - 4] = 248069;
-                prompt.v[prompt.len - 3] = 271;
-                prompt.len -= 2;
-            }
         } else {
             ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
         }
