@@ -65,7 +65,6 @@ def run_capture(
     n_layer: int,
     n_embd: int,
     work: Path,
-    ple: Path | None = None,
 ) -> list[list[float]]:
     """Run ds4 once and return the last prompt-row dump for every layer."""
     prompt_path = work / "prompt.txt"
@@ -86,8 +85,6 @@ def run_capture(
         "-n", "1",
         "--prefill-chunk", str(max(ctx, 1024)),
     ]
-    if ple is not None:
-        cmd += ["--ple", str(ple)]
     if system:
         cmd += ["--system", system]
     cmd.append("--think" if think else "--nothink")
@@ -137,8 +134,6 @@ def main() -> None:
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
                     help="runtime-editable activation stream at the profile's embedding width")
-    ap.add_argument("--ple", default="",
-                    help="Qwen3.8 PLE sidecar GGUF (required for qwen3.8-flash-next)")
     ap.add_argument("--think", action="store_true",
                     help="capture after <think>; default captures direct answers")
     ap.add_argument("--pair-normalize", action="store_true",
@@ -151,9 +146,6 @@ def main() -> None:
     model_arg = Path(args.model)
     model = model_arg.resolve()
     n_layer, n_embd = MODEL_PROFILES[args.profile]
-    ple = Path(args.ple).resolve() if args.ple else None
-    if args.profile.startswith("qwen") and ple is None:
-        raise SystemExit("qwen profiles need --ple pointing at the PLE sidecar")
     good_prompts = read_prompt_file(Path(args.good_file))
     bad_prompts = read_prompt_file(Path(args.bad_file))
     n = min(len(good_prompts), len(bad_prompts))
@@ -173,11 +165,9 @@ def main() -> None:
             gw.mkdir()
             bw.mkdir()
             good_rows = run_capture(ds4, model, good, args.system, args.think,
-                                    args.ctx, args.component, n_layer, n_embd, gw,
-                                    ple)
+                                    args.ctx, args.component, n_layer, n_embd, gw)
             bad_rows = run_capture(ds4, model, bad, args.system, args.think,
-                                   args.ctx, args.component, n_layer, n_embd, bw,
-                                    ple)
+                                   args.ctx, args.component, n_layer, n_embd, bw)
             add_rows(good_sum, good_rows, n_layer)
             add_rows(bad_sum, bad_rows, n_layer)
             if args.pair_normalize:

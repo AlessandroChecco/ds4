@@ -12,7 +12,6 @@ import numpy as np
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--ple", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -35,7 +34,7 @@ def main():
     env["DS4_QWEN4_FT_LIST"] = str(manifest)
     result = subprocess.run(
         [str(root / "ds4"), "--metal", "-m", str(args.model.resolve()),
-         "--ple", str(args.ple.resolve()), "--ctx", "256",
+         "--ctx", "256",
          "--first-token-test", "-p", "hello"], cwd=root, env=env,
         capture_output=True, timeout=300)
     (out / "stdout").write_bytes(result.stdout)

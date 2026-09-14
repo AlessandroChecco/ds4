@@ -34,6 +34,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
+#include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #endif
 #include <stdarg.h>
@@ -986,10 +987,6 @@ typedef struct {
 } ds4_qwen4_ple_hash;
 
 static ds4_qwen4_ple_hash g_ds4_qwen4_ple;
-
-/* True while a Qwen3.8 PLE n-gram sidecar (--ple) owns w->ple_embd: the
- * tensor lives in a separate CPU-only mapping, never in a Metal view. */
-static bool g_ds4_ple_sidecar;
 
 static bool ds4_model_is_glm53(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_GLM53;
@@ -2391,7 +2388,7 @@ typedef struct {
 typedef struct ds4_model {
     int fd;
     const uint8_t *map;
-    uint64_t size;       /* Addressable weight mapping; excludes disk-only Engram. */
+    uint64_t size;       /* Addressable weights, excluding disk-only n-grams. */
     uint64_t file_size;
 
     uint32_t version;
@@ -2404,9 +2401,8 @@ typedef struct ds4_model {
     ds4_kv *kv;
     ds4_tensor *tensors;
 
-    /* Qwen3.8 external PLE n-gram sidecar (--ple): when set, w->ple_embd
-     * lives in this CPU-only mapping and PLE reads resolve to it. */
-    struct ds4_model *ple_model;
+    int ngram_fd;
+    const ds4_tensor *ngram_tensor;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2630,12 +2626,14 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 
 static void model_close(ds4_model *m) {
     if (!m) return;
+    if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+    m->ngram_fd = -1;
 }
 
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
@@ -2794,6 +2792,54 @@ static void model_unmap_engram(ds4_model *m) {
     m->size = start;
 }
 
+/* Like V4.1 Engram, the n-gram table must trail the resident weights. This
+ * prevents warming or a future whole-model GPU view from faulting it in. */
+static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen4exp")) return;
+    const ds4_tensor *table = NULL;
+    uint64_t resident_end = m->tensor_data_pos;
+    m->max_tensor_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
+            if (table || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
+                !t->dim[0] || t->dim[0] > 160 || !t->dim[1] || t->dim[1] > UINT32_MAX)
+                ds4_die("Qwen requires original BF16 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+            table = t;
+        } else {
+            if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
+            if (t->abs_offset + t->bytes > resident_end) resident_end = t->abs_offset + t->bytes;
+            if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
+        }
+    }
+    /* Tokenizer inspection can still open old main-only files. Inference
+     * rejects them when binding its required n-gram tensor. */
+    if (!table) return;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || table->abs_offset % (uint64_t)page || resident_end > table->abs_offset)
+        ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat main_st, table_st;
+    if (fd < 0) ds4_die_errno("cannot open n-gram table", path);
+    if (fstat(fd, &table_st) || fstat(m->fd, &main_st) ||
+        table_st.st_dev != main_st.st_dev || table_st.st_ino != main_st.st_ino ||
+        table_st.st_size < 0 || (uint64_t)table_st.st_size != m->file_size) {
+        close(fd);
+        ds4_die("Qwen GGUF changed while opening its n-grams");
+    }
+#ifdef __APPLE__
+    if (fcntl(fd, F_NOCACHE, 1) || fcntl(fd, F_RDAHEAD, 0))
+        ds4_die_errno("cannot configure n-gram disk reads", path);
+#endif
+    if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
+        ds4_die_errno("cannot unmap disk-only n-grams", path);
+    m->size = table->abs_offset;
+    m->ngram_fd = fd;
+    m->ngram_tensor = table;
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2802,6 +2848,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+    m->ngram_fd = -1;
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -2844,6 +2891,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
     model_unmap_engram(m);
+    model_unmap_qwen_ngrams(m, path);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -5471,13 +5519,12 @@ static void weights_validate_qwen4_layout(
     if (w->token_embd) {
         tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
-    if (require_token_embd && !w->ple_embd) ds4_die("required per_layer_token_embd tensor is missing");
+    if (require_token_embd && !w->ple_embd)
+        ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_F32 && t != DS4_TENSOR_F16 && t != DS4_TENSOR_Q8_0 &&
-            t != DS4_TENSOR_MXFP4 && t != DS4_TENSOR_Q4_0 &&
-            !(t == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
-            fprintf(stderr, "ds4: per_layer_token_embd has unsupported type %u\n", t);
+        if (t != DS4_TENSOR_BF16) {
+            fprintf(stderr, "ds4: n-gram embeddings must use original BF16, got type %u\n", t);
             exit(1);
         }
         if (w->ple_embd->ndim != 2 || w->ple_embd->dim[0] != DS4_N_PLE_HEAD_DIM ||
@@ -7876,12 +7923,7 @@ static void weights_bind(
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
     if (ds4_model_is_qwen4()) {
-        /* An external --ple sidecar owns the table: the inline tensor is
-         * optional in the main GGUF and ple.weight wins either way. */
-        w->ple_embd = (require_token_embd && !m->ple_model) ?
-            required_tensor(m, "per_layer_token_embd.weight") :
-            model_find_tensor(m, "per_layer_token_embd.weight");
-        if (m->ple_model) w->ple_embd = required_tensor(m->ple_model, "ple.weight");
+        w->ple_embd = model_find_tensor(m, "per_layer_token_embd.weight");
     }
     weights_bind_output(w, m, require_output, optional_output);
 
@@ -8408,9 +8450,7 @@ static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, con
     model_map_span_vec_include_one(spans, w->output_hc_norm);
     model_map_span_vec_include_one(spans, w->output_hc_down);
     model_map_span_vec_include_one(spans, w->output_hc_up);
-    /* A --ple sidecar tensor lives in its own CPU-only mapping; never fold
-     * its span into the main model's residency map. */
-    if (!g_ds4_ple_sidecar) model_map_span_vec_include_one(spans, w->ple_embd);
+    /* N-gram rows are read from disk, never included in GPU weight views. */
 }
 
 static int model_map_span_cmp(const void *a, const void *b) {
@@ -42180,7 +42220,6 @@ struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
-    ds4_model ple_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -44889,59 +44928,6 @@ static uint64_t glm_graph_host_memory_bytes(void) {
 #else
     return 0;
 #endif
-}
-
-/* Bounded residency for the external PLE n-gram sidecar.  Each token
- * gathers one ~100-byte row per hash head from the read-only sidecar
- * mapping; because n-gram keys track the newest tokens, touched pages are
- * rarely re-referenced yet stay resident for the whole session.
- * DS4_QWEN4_PLE_EVICT_TOKENS=N drops the clean sidecar pages every N
- * gathered tokens (0 or unset disables this), bounding the resident set to
- * the recent token window; recurring n-grams re-fault from disk. */
-static uint64_t qwen4_ple_sidecar_row_bytes(const ds4_tensor *t) {
-    const uint64_t n = t->dim[0], blocks = n / 32u;
-    switch (t->type) {
-    case DS4_TENSOR_F32:  return n * 4u;
-    case DS4_TENSOR_F16:
-    case DS4_TENSOR_BF16: return n * 2u;
-    case DS4_TENSOR_Q8_0: return blocks * 34u;
-    case DS4_TENSOR_Q4_0: return blocks * 18u;
-    case DS4_TENSOR_Q4_1: return blocks * 20u;
-    default: return 0;
-    }
-}
-
-static void qwen4_ple_sidecar_evict(const ds4_model *m, const ds4_tensor *t) {
-    const uint64_t row_bytes = qwen4_ple_sidecar_row_bytes(t);
-    if (!row_bytes) return;
-    const uint64_t span = row_bytes * t->dim[1];
-    uint8_t *base = (uint8_t *)m->ple_model->map + t->abs_offset;
-    const uint64_t page = (uint64_t)getpagesize();
-    const uintptr_t start = ((uintptr_t)base) & ~(uintptr_t)(page - 1u);
-    const uintptr_t end = (((uintptr_t)base) + span + page - 1u) & ~(uintptr_t)(page - 1u);
-    const size_t len = (size_t)(end - start);
-    /* Note: mincore() and pages_resident both report page-cache residency
-     * of the backing file on macOS, not pages mapped into this task, so the
-     * sweep does not log a residency figure; vmmap against the live process
-     * is the reliable measurement for the sidecar region. */
-    (void)posix_madvise((void *)start, len, POSIX_MADV_DONTNEED);
-    fprintf(stderr,
-            "ds4: PLE sidecar eviction: dropped sidecar pages (%.2f GiB span)\n",
-            (double)span / (1024.0 * 1024.0 * 1024.0));
-}
-
-static void qwen4_ple_sidecar_evict_maybe(const ds4_model *m, const ds4_weights *w) {
-    static uint64_t interval = UINT64_MAX; /* UINT64_MAX = not parsed yet */
-    if (!g_ds4_ple_sidecar || !m->ple_model || !w->ple_embd) return;
-    if (interval == UINT64_MAX) {
-        const char *env = getenv("DS4_QWEN4_PLE_EVICT_TOKENS");
-        interval = (env && env[0]) ? strtoull(env, NULL, 10) : 0;
-    }
-    if (!interval) return;
-    static uint64_t gathered;
-    if (++gathered < interval) return;
-    gathered = 0;
-    qwen4_ple_sidecar_evict(m, w->ple_embd);
 }
 
 #ifndef DS4_NO_GPU
@@ -57313,6 +57299,111 @@ static int generate_glm_metal_argmax(
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
+static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
+    const ds4_tensor *t = m->ngram_tensor;
+    if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
+        t->type != DS4_TENSOR_BF16 || !t->dim[0] || t->dim[0] > 160) {
+        errno = EINVAL;
+        return false;
+    }
+    uint8_t raw[320];
+    const size_t bytes = t->dim[0] * 2u;
+    const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t n = pread(m->ngram_fd, raw + done, bytes - done, (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (!n) errno = EIO;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    for (size_t i = 0; i < t->dim[0]; i++) {
+        uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
+        if ((bits & 0x7f800000u) == 0x7f800000u) {
+            errno = EDOM;
+            return false;
+        }
+        memcpy(out + i, &bits, sizeof(bits));
+    }
+    return true;
+}
+
+typedef struct { uint32_t row, output; } qwen4_ngram_request;
+typedef struct {
+    const ds4_model *model;
+    qwen4_ngram_request *request;
+    float *out;
+    size_t count, readers;
+    int error[16];
+} qwen4_ngram_batch;
+
+static int qwen4_ngram_order(const void *a, const void *b) {
+    const qwen4_ngram_request *x = a, *y = b;
+    return (x->row > y->row) - (x->row < y->row);
+}
+
+static void qwen4_ngram_part(void *context, size_t part) {
+    qwen4_ngram_batch *b = context;
+    const size_t begin = b->count * part / b->readers, end = b->count * (part+1) / b->readers;
+    const size_t width = b->model->ngram_tensor->dim[0];
+    float *previous = NULL;
+    for (size_t i = begin; i < end; i++) {
+        float *dst = b->out + b->request[i].output * width;
+        if (i > begin && b->request[i].row == b->request[i-1].row) {
+            memcpy(dst, previous, width * sizeof(float));
+        } else if (!qwen4_ngram_row(b->model, b->request[i].row, dst)) {
+            b->error[part] = errno;
+            return;
+        }
+        previous = dst;
+    }
+}
+
+/* Bound sorting memory and I/O concurrency independently of context size.
+ * Small decode requests avoid scheduling workers; all reads precede GPU use. */
+static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t count, float *out) {
+    if (!m || !m->ngram_tensor || m->ngram_fd < 0 || (count && (!rows || !out)) ||
+        count > SIZE_MAX / (160u * sizeof(float))) {
+        errno = EINVAL;
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (rows[i] >= m->ngram_tensor->dim[1]) { errno = EINVAL; return false; }
+    }
+    if (count < 256) {
+        for (size_t i = 0; i < count; i++)
+            if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_tensor->dim[0])) return false;
+        return true;
+    }
+    enum { MAX_ROWS = 4096 };
+    qwen4_ngram_request *request = malloc(MAX_ROWS * sizeof(*request));
+    if (!request) return false;
+    bool ok = true;
+    for (size_t off = 0; ok && off < count; off += MAX_ROWS) {
+        size_t n = count-off < MAX_ROWS ? count-off : MAX_ROWS;
+        for (size_t i = 0; i < n; i++) request[i] = (qwen4_ngram_request){rows[off+i], (uint32_t)i};
+        qsort(request, n, sizeof(*request), qwen4_ngram_order);
+        qwen4_ngram_batch batch = {.model = m, .request = request, .count = n,
+            .out = out + off * m->ngram_tensor->dim[0], .readers = 1};
+#ifdef __APPLE__
+        batch.readers = 16;
+        dispatch_apply_f(batch.readers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                         &batch, qwen4_ngram_part);
+#else
+        qwen4_ngram_part(&batch, 0);
+#endif
+        for (size_t i = 0; i < batch.readers; i++) {
+            if (batch.error[i]) { errno = batch.error[i]; ok = false; break; }
+        }
+    }
+    int error = errno;
+    free(request);
+    errno = error;
+    return ok;
+}
+
 /* Multimodal rope positions (HF get_rope_index): text tokens share one
  * counter; an image's tokens take (t, t+row, t+col) from the counter at the
  * image start, which then advances by max(rows, cols).  *delta tracks
@@ -57494,13 +57585,8 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         fprintf(stderr, "ds4: Qwen3.8 Metal graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
         return false;
     }
-    if (w->ple_embd->type != DS4_TENSOR_F32 && w->ple_embd->type != DS4_TENSOR_F16 &&
-        w->ple_embd->type != DS4_TENSOR_Q8_0 && w->ple_embd->type != DS4_TENSOR_Q4_0 &&
-        w->ple_embd->type != DS4_TENSOR_MXFP4 &&
-        !(w->ple_embd->type == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
-        fprintf(stderr,
-                "ds4: Qwen3.8 Metal graph needs a F32/F16/Q8_0/Q4_0/MXFP4 n-gram table "
-                "(or a Q4_1 --ple sidecar)\n");
+    if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
+        fprintf(stderr, "ds4: Qwen3.8 requires original BF16 n-grams in the model GGUF\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -58262,7 +58348,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 }
 
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
-static void qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
@@ -58280,16 +58366,12 @@ static void qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         if (t == 0 && g->snap_after_first) g->snap_mrope_delta = g->mrope_delta;
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
     }
-    ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float));
-    ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+    if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
+        !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
+        return false;
+    uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
-        uint32_t rows[DS4_MAX_PLE_HEADS];
-        qwen4_ple_step(tokens[t], g->ple_prev, rows);
-        for (uint32_t h = 0; h < DS4_N_PLE_HEADS; h++) {
-            qwen4_ref_row(m->ple_model ? m->ple_model : m, w->ple_embd, rows[h],
-                          row + (uint64_t)t * E + (uint64_t)h * DS4_N_PLE_HEAD_DIM);
-        }
-        qwen4_ple_sidecar_evict_maybe(m, w);
+        qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
         if (t == 0 && g->snap_after_first) {
             memcpy(g->snap_ple_prev, g->ple_prev, sizeof(g->snap_ple_prev));
             g->snap_pos = g->pos + 1u;
@@ -58298,8 +58380,16 @@ static void qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             memcpy(g->snap2_ple_prev, g->ple_prev, sizeof(g->snap2_ple_prev));
             g->snap2_pos = g->pos + 2u;
         }
+        if (t % 256u == 255u || t + 1 == T) {
+            const uint32_t start = t / 256u * 256u;
+            if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
+                                  row + (uint64_t)start * E)) {
+                fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
+                return false;
+            }
+        }
     }
-    ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float));
+    return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
@@ -58337,7 +58427,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
     }
     const double t0 = timing ? now_sec() : 0.0;
-    qwen4_graph_stage_inputs(g, m, w, tokens, T);
+    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -66857,19 +66947,17 @@ static void qwen4_ple_step(int token, int *prev, uint32_t *rows) {
     prev[0] = token;
 }
 
-static void qwen4_ref_ple(const ds4_model *m, const ds4_weights *w, const ds4_layer_weights *l,
+static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
                           qwen4_ref_state *st, int token, float *R) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
-    const uint32_t n_heads = DS4_N_PLE_HEADS, hd = DS4_N_PLE_HEAD_DIM;
+    const uint32_t n_heads = DS4_N_PLE_HEADS;
     const uint32_t hist_rows = (DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM;
     uint32_t rows[DS4_MAX_PLE_HEADS];
     qwen4_ple_step(token, st->ple_prev, rows);
-    qwen4_ple_sidecar_evict_maybe(m, w);
 
     float *emb = xmalloc(E * sizeof(float));
-    for (uint32_t h = 0; h < n_heads; h++)
-        qwen4_ref_row(m->ple_model ? m->ple_model : m, w->ple_embd, rows[h],
-                      emb + (uint64_t)h * hd);
+    if (!qwen4_ngram_read(m, rows, n_heads, emb))
+        ds4_die_errno("cannot read Qwen n-grams", "GGUF");
 
     float *key = xmalloc(hc_dim * sizeof(float));
     float *keyn = xmalloc(hc_dim * sizeof(float));
@@ -67157,7 +67245,7 @@ static void qwen4_ref_layer(const ds4_model *m, const ds4_weights *w, uint32_t i
     const ds4_layer_weights *l = &w->layer[il];
     float mixed[DS4_MAX_EMBD], blk[DS4_MAX_EMBD], inj[DS4_MAX_HC];
 
-    if (ds4_qwen4_layer_is_ple(il)) qwen4_ref_ple(m, w, l, st, token, R);
+    if (ds4_qwen4_layer_is_ple(il)) qwen4_ref_ple(m, l, st, token, R);
     qwen4_ref_hc_mix(m, R, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, mixed, inj);
     if (ds4_qwen4_layer_is_linear(il)) qwen4_ref_linear(m, l, il, st, mixed, blk);
     else qwen4_ref_attention(m, l, il, st, mixed, pos, blk);
@@ -69974,7 +70062,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->vision_model.fd = -1;
-    e->ple_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->glm_mtp = opt->glm_mtp;
@@ -70248,72 +70335,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ds4_backend_name(e->backend));
         }
     }
-    if (opt->ple_path && opt->ple_path[0]) {
-        if (!ds4_model_is_qwen4()) {
-            fprintf(stderr, "ds4: --ple is only supported for Qwen3.8-Flash-Next models\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        /* CPU-only private mapping: the PLE gather runs on the host, so the
-         * sidecar never joins a Metal view or the main residency map.  The
-         * sidecar is demand-paged by design: each token touches ~one page per
-         * hash head of the 30+ GiB table, and a WILLNEED prefault would pull
-         * the whole sidecar into the page cache, which on memory-tight
-         * machines becomes startup pressure for pages that are rarely
-         * re-referenced. */
-        model_open(&e->ple_model, opt->ple_path, false, false);
-        const ds4_tensor *ple_t = model_find_tensor(&e->ple_model, "ple.weight");
-        if (!ple_t) {
-            fprintf(stderr, "ds4: --ple sidecar %s has no ple.weight tensor\n",
-                    opt->ple_path);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (ple_t->ndim != 2 || ple_t->dim[0] != DS4_N_PLE_HEAD_DIM ||
-            ple_t->dim[1] < g_ds4_qwen4_ple.n_rows) {
-            fprintf(stderr,
-                    "ds4: --ple sidecar ple.weight layout [%" PRIu64 ", %" PRIu64 "] does not "
-                    "cover %u x %" PRIu64 " hash rows\n",
-                    ple_t->dim[0], ple_t->dim[1], DS4_N_PLE_HEAD_DIM,
-                    g_ds4_qwen4_ple.n_rows);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        e->model.ple_model = &e->ple_model;
-        g_ds4_ple_sidecar = true;
-        fprintf(stderr,
-                "ds4: PLE sidecar table: %s (ple.weight [%u, %" PRIu64 "], CPU-only)\n",
-                opt->ple_path, DS4_N_PLE_HEAD_DIM, ple_t->dim[1]);
-        /* Full prefault only with real headroom: the sidecar must fit
-         * beside the resident model plus an OS margin, otherwise demand
-         * paging keeps tight machines (a 64 GB Mac needs ~0.7 GiB for the
-         * gather working set instead of ~10 GiB of pressure-limited
-         * prefaulted pages).  DS4_QWEN4_PLE_PREFETCH_FULL=1/0 overrides. */
-        int prefault_full = -1;
-        const char *prefetch_env = getenv("DS4_QWEN4_PLE_PREFETCH_FULL");
-        if (prefetch_env && prefetch_env[0])
-            prefault_full = strcmp(prefetch_env, "0") != 0;
-        if (prefault_full < 0) {
-            const uint64_t ram_total = glm_graph_host_memory_bytes();
-            if (ram_total == 0) {
-                fprintf(stderr, "ds4: cannot read hw.memsize; PLE prefault disabled\n");
-                prefault_full = 0;
-            } else {
-                const uint64_t margin = 16ull * 1024ull * 1024ull * 1024ull;
-                prefault_full = ram_total >= e->model.size + ple_t->bytes + margin;
-            }
-        }
-        if (prefault_full) {
-            model_prefetch_cpu_mapping(&e->ple_model);
-            fprintf(stderr, "ds4: PLE sidecar resident prefetch enabled (full table)\n");
-        } else {
-            fprintf(stderr, "ds4: PLE sidecar demand-paged (insufficient RAM headroom "
-                            "or DS4_QWEN4_PLE_PREFETCH_FULL=0)\n");
-        }
-    }
     weights_bind(&e->weights,
                  &e->model,
                  load_slice,
@@ -70321,6 +70342,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_layer_end,
                  load_output,
                  load_output_optional);
+    if (e->model.ngram_tensor) {
+        fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
+                (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
+    }
     if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (!e->weights.layer[il].ffn_exp_probs_vl) {
@@ -72203,9 +72228,6 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
-    e->model.ple_model = NULL;
-    g_ds4_ple_sidecar = false;
-    if (e->ple_model.map) model_close(&e->ple_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     if (e->shared_prefill_workspace_ready) {

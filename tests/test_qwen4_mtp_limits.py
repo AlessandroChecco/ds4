@@ -10,14 +10,13 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--ple", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     out = args.output or Path(tempfile.mkdtemp(prefix="qwen-mtp-limits-"))
     out.mkdir(parents=True, exist_ok=True)
     base = [str(root / "ds4"), "-m", str(args.model.resolve()),
-            "--ple", str(args.ple.resolve()), "--ctx", "256", "--temp", "0",
+            "--ctx", "256", "--temp", "0",
             "--nothink", "-p", "Count from one to ten.", "-n", "24"]
     for name, chunk, unfused in [("one-row", 1, False),
                                   ("two-rows-depth-three", 2, False),

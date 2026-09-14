@@ -22,7 +22,6 @@ enum {
 
 typedef struct {
     const char *model_path;
-    const char *ple_path;
     const char *prompt_path;
     const char *candidate_env;
     const char *candidate_value;
@@ -52,7 +51,6 @@ static void usage(FILE *fp, const char *argv0) {
             "usage: %s --candidate-env NAME [options]\n"
             "\n"
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
-            "  --ple PATH             optional PLE sidecar\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --candidate-env NAME   unset NAME for control, set it for candidate\n"
             "  --candidate-value TEXT candidate env value (default: 1)\n"
@@ -118,8 +116,6 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             cfg.prompt_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--ple")) {
-            cfg.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--control-value")) {
             cfg.control_value = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--candidate-value")) {
@@ -380,7 +376,6 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
-        .ple_path = cfg.ple_path,
         .backend = DS4_BACKEND_METAL,
         .context_size = cfg.ctx,
         .prefill_chunk = (uint32_t)cfg.prefill_chunk,

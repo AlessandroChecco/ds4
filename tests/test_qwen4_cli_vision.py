@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Model-backed regression test for Qwen CLI image turns and follow-up text.
 
-Run with uv run tests/test_qwen4_cli_vision.py --model MAIN --ple PLE
+Run with uv run tests/test_qwen4_cli_vision.py --model MAIN
 --vision MMPROJ --image FIRST.png --image SECOND.png. Tests ordinary and MTP
 decode. Use two different images to exercise image changes in one conversation.
 """
@@ -17,7 +17,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="./ds4")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--ple", required=True)
     parser.add_argument("--vision", required=True)
     parser.add_argument("--image", action="append", required=True)
     parser.add_argument("--out-dir")
@@ -35,7 +34,7 @@ def main():
         for path in images
     ) + "/quit\n"
     base = [str(pathlib.Path(args.binary).resolve()), "-m", args.model,
-            "--ple", args.ple, "--vision", args.vision, "--ctx", "8192",
+            "--vision", args.vision, "--ctx", "8192",
             "--temp", "0", "--nothink", "-n", "180"]
     print(f"Logs: {out}", flush=True)
     for mode, extra in [("ordinary", []), ("mtp", ["--mtp"])]:

@@ -13,7 +13,6 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--ple", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -25,7 +24,7 @@ def main():
         bank[layer * 2560] = 1.0
     path = out / "directions.f32"
     path.write_bytes(bank.tobytes())
-    base = [str(root / "ds4"), "-m", str(args.model.resolve()), "--ple", str(args.ple.resolve()),
+    base = [str(root / "ds4"), "-m", str(args.model.resolve()),
             "--ctx", "512", "--temp", "0", "--nothink", "-p",
             "Write a three-sentence summary of the plot of Hamlet."]
 
@@ -54,7 +53,7 @@ def main():
         work = out / component
         work.mkdir(exist_ok=True)
         rows = capture.run_capture(root / "ds4", args.model.resolve(), "Explain a rainbow.",
-                                   "", False, 512, component, 48, 2560, work, args.ple.resolve())
+                                   "", False, 512, component, 48, 2560, work)
         assert len(rows) == 48 and all(len(r) == 2560 for r in rows)
         assert all(math.isfinite(v) for r in rows for v in r)
         assert all(any(v != 0 for v in r) for r in rows)

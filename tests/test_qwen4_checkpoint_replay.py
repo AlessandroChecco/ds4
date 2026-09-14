@@ -1,6 +1,6 @@
-"""Live Qwen checkpoint regression; requires the model and PLE sidecar.
+"""Live Qwen checkpoint regression; requires a self-contained model GGUF.
 
-python tests/test_qwen4_checkpoint_replay.py --model MODEL --ple PLE
+python tests/test_qwen4_checkpoint_replay.py --model MODEL
 """
 
 import argparse
@@ -41,7 +41,6 @@ def stop(proc):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--ple", required=True)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -58,8 +57,6 @@ def main():
         str(root / "ds4-server"),
         "-m",
         str(pathlib.Path(args.model).resolve()),
-        "--ple",
-        str(pathlib.Path(args.ple).resolve()),
         "--ctx",
         "16384",
         "--port",
