@@ -2708,13 +2708,13 @@ repeated during consolidation.
   Repeat the reader with ASan/UBSan. Check exact BF16 values, duplicate and
   reordered rows, parallel reads, truncated files, invalid IDs and cleanup.
   Build `tests/test_qwen4_ngram_state` and run it with each real model under
-  Metal validation: prefill, decode and MTP failures must invalidate the live
+  Metal validation and CUDA: prefill, decode and MTP failures must invalidate the live
   frontier; rebuilding and continuing must match an independent session exactly.
 - Audit every copied main/MTP tensor against its input and every n-gram shard
   against the pinned BF16 source. Packaging must not requantize the calibrated
   experts. Verify the final checksum and download target before release.
 - Confirm the table is outside the runtime mapping and all Metal residency
-  views, including weight warming. Measure actual memory during short/long
+  views and CUDA model caches, including weight warming. Measure actual memory during short/long
   prefill and generation; adding 95.37 GiB on disk must not add that much RAM.
   Test one model at a time on an M5 Max. Keep space for the complete output
   plus a reserve during conversion; do not fill the system disk.
@@ -2730,6 +2730,79 @@ repeated during consolidation.
 - Repeat focused DeepSeek and GLM checks after shared loader changes. Record
   skipped hardware or reference checks explicitly; coherent Qwen replies do
   not establish parity with the original HF model or a hosted API.
+- On CUDA, run `make test-qwen4-cuda` and compute-sanitizer memcheck. Exercise
+  Q2's padded down rows, Q4_K/MXFP4 experts, all dense formats, long recurrent
+  scans, sparse causal selection and MTP snapshots against the CPU oracles.
+  Tensor-core paths must pass the same tolerances as scalar kernels.
+- Build `tests/test_qwen4_prefill` and run it with a real prompt through at
+  least 8K context on both Metal and CUDA. Same-schedule replay must agree;
+  record different-schedule probability differences separately. Nearly tied
+  experts can amplify normal rounding, so a max-logit difference alone does
+  not establish a state bug or a quality regression.
+- Run `tests/test_server_story.py` with at least 49K server context: all sixteen
+  story facts, the correction turn and cached-prefix reuse must pass. Also
+  run `tests/test_agent_vision.py` with a long archive and
+  `tests/test_server_vision_agent.py` through Pi's three supported APIs.
+  Check the code with independent assertions, not the agent's own report.
+  Run the CUDA session-batch oracle with Qwen to check isolation and reordered
+  serial fallback; do not label its throughput as native batching.
+  For `tests/test_cuda_mixed_batch`, set `DS4_TEST_CUDA_SINGLE_GPU=1` and
+  `DS4_TEST_ALLOW_FALLBACK=1`; the full-logit oracle still requires exact replay.
+  Repeat with explicit `--gpu-vram` admission: exclude disk-only n-grams,
+  include each session's independent workspace, and reject insufficient
+  resident-weight budgets. Mixed prefill/decode must use the Qwen fallback,
+  never the DeepSeek graph.
+
+### CUDA port, 2026-09-15
+
+Tested Q2 on DGX Spark .180 and Q4 on .181, with original BF16 disk-only
+n-grams. M5 Max IT supplied the Metal regression control. No local M3
+inference was run. All builds were warning-free; the ROCm host code passed
+a warning-as-error syntax check, not a ROCm GPU build or inference test.
+
+- CUDA kernels passed independent CPU references for quantized projections,
+  routing, attention, recurrent state and snapshots, including 8191/8192/8193
+  token scans. Compute-sanitizer memcheck reported zero errors.
+- Q2 four-session isolation passed 24 decoding steps with reordered groups:
+  zero differing logits versus separate execution. Q4 mixed 128-token prefill
+  and three decode rows passed three rounds with exact logits. Both use serial
+  fallback, not native multi-session kernels. These tests caught and fixed
+  disk-table VRAM accounting and an incorrect DeepSeek batch dispatch.
+- Q4 checkpoint cancellation, repeated restore, malformed payloads, rewinds,
+  n-gram read-error recovery, MTP limits and steering passed. Server checkpoint
+  replay passed nine requests plus restarts, with reasoning omitted or echoed.
+  Q2 full-context agent text save/reload recovery passed as well.
+- An eight-token Q4 CPU-reference run with four-row GPU chunks checked two
+  text positions: maximum logit difference 0.001721, both top tokens equal.
+  All seven MTP top tokens agreed (maximum logit difference 0.071876); three
+  paired-versus-single MTP checks passed, maximum difference 0.00009418.
+- Q2 and Q4 each recalled all sixteen facts from a 31,186-token story and
+  applied both corrections on the next turn. Each reused 31,278 cached tokens
+  and prefetched only the 52-token addition.
+- The Q2 native agent passed image inspection and code edits from a 9,531-token
+  prefix through 12,096 tokens, retaining its cache on every tool continuation.
+  Q4 with exact-sampling MTP passed Pi's two-image coding task through Chat
+  Completions, Responses and Anthropic. Independent code assertions passed.
+- Four vision fixtures passed the HF graph using identical GGUF weights;
+  minimum per-token cosine was 0.99346. This is implementation parity, not
+  comparison with the original BF16 checkpoint.
+- Metal Qwen kernels, mixed prefill/progress, snapshot and MTP rewind checks
+  passed. DeepSeek Flash and GLM Flash Q2 snapshot regressions passed on CUDA
+  and Metal. The Metal DeepSeek control used Vision Experimental; CUDA used
+  Flash 0731. Server and native-agent unit suites passed on both backends.
+
+Single-run Q2 timings: 16K prefill 250.04 t/s, a 13,616-token continuation to
+30K 243.26 t/s, ordinary decode 17.30/17.33 t/s. A separate 256-token prose
+test measured 17.12 t/s ordinarily and 19.91 t/s with MTP, temperature zero.
+These are not medians or evidence of a native batching speedup.
+
+Different chunk schedules and backends are not bit-identical. At token 129,
+a router cutoff margin of 1.43e-6 exchanged two experts after a 9.06e-6
+projection difference. Same-schedule replay was exact through 8K on each
+backend. Different-schedule probability changes can be much larger near a
+cutoff, including on the unchanged Metal path. The task oracles above passed,
+but original-HF/hosted-API continuation scoring was not performed. Neither
+original-checkpoint vision quality nor non-Spark CUDA hardware was validated.
 
 ### Native n-gram release, 2026-09-14
 

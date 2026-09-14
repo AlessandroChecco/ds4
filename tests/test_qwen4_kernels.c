@@ -1,4 +1,4 @@
-/* Metal kernel tests for Qwen3.8-Flash-Next (metal/qwen4.metal): every kernel
+/* GPU kernel tests for Qwen3.8-Flash-Next: every kernel
  * at the release and mini model shapes against a double-precision reference.
  * Build: make test-qwen4-kernels */
 
@@ -177,8 +177,10 @@ static uint64_t arena_q4_0(arena_t *a, uint64_t rows, uint64_t cols, double **sh
             memcpy(blk, &dh, 2);
             for (int j = 0; j < 16; j++) {
                 int q0 = (int)(vals[j] * id + 8.5f), q1 = (int)(vals[j + 16] * id + 8.5f);
-                if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-                if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+                if (q0 < 0) q0 = 0;
+                if (q0 > 15) q0 = 15;
+                if (q1 < 0) q1 = 0;
+                if (q1 > 15) q1 = 15;
                 blk[2 + j] = (uint8_t)(q0 | (q1 << 4));
                 (*shadow)[r * cols + b * 32 + j] = dq * (q0 - 8);
                 (*shadow)[r * cols + b * 32 + 16 + j] = dq * (q1 - 8);
@@ -578,9 +580,14 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
     ds4_gpu_tensor *gblk = upload(blk, (uint64_t)T * E);
     require_ok(ds4_gpu_qwen4_hc_norm_tensor(gxn, ginj, gR, a->base, a->size, gamma_off, inj_off, wtype, T, E, hc, hc, eps),
                "hc norm");
+#ifdef __APPLE__
     require_ok(q8 ? ds4_gpu_matmul_q8_0_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
              : f16 ? ds4_gpu_matmul_f16_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
                    : ds4_gpu_matmul_f32_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T), "hc down gemv");
+#else
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(glo, gxn, a->base, a->size,
+                    down_off, wtype, T, dim, rank), "hc down projection");
+#endif
     require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(gmixed, gxn, glo, a->base, a->size, up_off, up_type, T, E, hc, rank),
                "hc gate mix");
     require_ok(ds4_gpu_qwen4_hc_combine_tensor(gR, gblk, ginj, T, E, hc), "hc combine");
@@ -806,7 +813,11 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
 
 /* ---- indexer radix select ---- */
 
+#ifdef __APPLE__
 static int cmp_desc_idx(void *ctx, const void *a, const void *b) {
+#else
+static int cmp_desc_idx(const void *a, const void *b, void *ctx) {
+#endif
     const float *sc = ctx;
     const int32_t ia = *(const int32_t *)a, ib = *(const int32_t *)b;
     if (sc[ia] != sc[ib]) return sc[ia] > sc[ib] ? -1 : 1;
@@ -832,7 +843,11 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     uint64_t bad = 0;
     for (uint32_t t = 0; t < T; t++) {
         for (uint32_t b = 0; b < n; b++) order[b] = (int32_t)b;
-        qsort_r(order, n, 4, sc + (uint64_t)t * n, cmp_desc_idx);   /* BSD argument order (macOS) */
+#ifdef __APPLE__
+        qsort_r(order, n, 4, sc + (uint64_t)t * n, cmp_desc_idx);
+#else
+        qsort_r(order, n, 4, cmp_desc_idx, sc + (uint64_t)t * n);
+#endif
         /* the k selected must equal the reference top-k as a set */
         int32_t *g = got + (uint64_t)t * k;
         for (uint32_t i = 0; i < k; i++) {
@@ -1630,8 +1645,8 @@ static void test_decode_fusions(arena_t *a) {
         ds4_gpu_tensor *ca = upload(NULL, na + guard), *cb = upload(NULL, nb + guard);
         require_ok(ds4_gpu_tensor_fill_f32(ra, 17.25f, na + guard) && ds4_gpu_tensor_fill_f32(ca, 17.25f, na + guard) &&
             ds4_gpu_tensor_fill_f32(rb, 17.25f, nb + guard) && ds4_gpu_tensor_fill_f32(cb, 17.25f, nb + guard), "Q8 guards");
-        require_ok(ds4_gpu_begin_commands() && ds4_gpu_matmul_q8_0_tensor(ra, a->base, a->size, wa, k, na, x, 1) &&
-            ds4_gpu_matmul_q8_0_tensor(rb, a->base, a->size, wb, k, nb, x, 1) &&
+        require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_matmul_q8_0_tensor(ra, a->base, a->size, wa, k, na, x, 1) &&
+            ds4_gpu_qwen4_matmul_q8_0_tensor(rb, a->base, a->size, wb, k, nb, x, 1) &&
             ds4_gpu_qwen4_q8_pair_tensor(ca, cb, a->base, a->size, wa, wb, k, na, nb, x, 1) && ds4_gpu_end_commands(), "Q8 concatenated dispatch");
         uint32_t cap = (na > nb ? na : nb) + guard;
         float *expected = malloc(cap * 4u), *actual = malloc(cap * 4u);
@@ -3016,6 +3031,80 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     ds4_gpu_tensor_free(gx); free(x);
 }
 
+#ifndef __APPLE__
+/* Check half-operand expert tiles independently at every CUDA tile width.
+ * The existing tests above still bound their error versus unrounded weights. */
+static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype) {
+    const uint32_t E = 256, F = 64, NE = 4, NS = 2, NO = 3, cap = T+7, guard = 16;
+    const uint32_t DF = dtype == 10 ? 256 : F;
+    double *gw, *uw, *dw;
+    uint64_t go = arena_tier(a,type,(uint64_t)NE*F,E,&gw);
+    uint64_t uo = arena_tier(a,type,(uint64_t)NE*F,E,&uw);
+    uint64_t d = arena_tier(a,dtype,(uint64_t)NE*E,DF,&dw);
+    float *x = rand_vec((uint64_t)T*E,1.0f);
+    int32_t *sel = malloc((uint64_t)T*NS*4);
+    require_ok(sel != NULL,"half tile selections allocation");
+    for (uint32_t t = 0; t < T; t++) { sel[t*NS] = 0; sel[t*NS+1] = 1+t%2; }
+    ds4_gpu_tensor *gx = upload(x,(uint64_t)T*E);
+    ds4_gpu_tensor *gs = ds4_gpu_tensor_alloc((uint64_t)T*NS*4);
+    ds4_gpu_tensor *gl = ds4_gpu_tensor_alloc((uint64_t)NE*cap*4);
+    ds4_gpu_tensor *gc = ds4_gpu_tensor_alloc(NE*4);
+    uint64_t nm = (uint64_t)T*NO*F, np = (uint64_t)T*NO*E;
+    ds4_gpu_tensor *gm = upload(NULL,nm+guard), *gp = upload(NULL,np+guard);
+    require_ok(gs && gl && gc && ds4_gpu_tensor_write(gs,0,sel,(uint64_t)T*NS*4),"half tile selection upload");
+    const float sentinel = -1234.5f;
+    require_ok(ds4_gpu_tensor_fill_f32(gm,sentinel,nm+guard) &&
+               ds4_gpu_tensor_fill_f32(gp,sentinel,np+guard),"half tile sentinels");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(gl,gc,gs,T,NS,NE,cap),"half tile list build");
+    int32_t counts[NE];
+    require_ok(ds4_gpu_tensor_read(gc,0,counts,sizeof(counts)),"half tile counts read");
+    require_ok(counts[0] == (int32_t)T && counts[1]+counts[2] == (int32_t)T && counts[3] == 0,
+               "half tile hot and empty experts");
+    require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gm,gx,gl,gc,a->base,a->size,go,uo,type,NE,T,NS,NO,E,F,cap),"half tile mid");
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gp,gm,gl,gc,a->base,a->size,d,dtype,NE,T,NS,NO,F,E,cap),"half tile down");
+    float *mid = download(gm,nm+guard), *part = download(gp,np+guard);
+    for (uint64_t i = nm; i < nm+guard; i++) require_ok(mid[i] == sentinel,"half tile mid tail");
+    for (uint64_t i = np; i < np+guard; i++) require_ok(part[i] == sentinel,"half tile down tail");
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t f = 0; f < F; f++) require_ok(mid[((uint64_t)t*NO+NS)*F+f] == sentinel,"half tile reserved mid slot");
+        for (uint32_t e = 0; e < E; e++) require_ok(part[((uint64_t)t*NO+NS)*E+e] == sentinel,"half tile reserved down slot");
+    }
+    const uint32_t samples[] = {0,1,31,32,63,64,127,128,1023,T-1};
+    float got[sizeof(samples)/sizeof(samples[0])*NS*(E+F)];
+    double ref[sizeof(got)/sizeof(got[0])];
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < sizeof(samples)/sizeof(samples[0]); j++) {
+        uint32_t t = samples[j];
+        if (t >= T) continue;
+        for (uint32_t s = 0; s < NS; s++) {
+            uint32_t e = sel[t*NS+s];
+            for (uint32_t f = 0; f < F; f++) {
+                double g = 0, u = 0;
+                for (uint32_t k = 0; k < E; k++) {
+                    double v = (_Float16)x[(uint64_t)t*E+k];
+                    g += (double)(_Float16)(float)gw[((uint64_t)e*F+f)*E+k]*v;
+                    u += (double)(_Float16)(float)uw[((uint64_t)e*F+f)*E+k]*v;
+                }
+                got[n] = mid[((uint64_t)t*NO+s)*F+f]; ref[n++] = silu_d(g)*u;
+            }
+            for (uint32_t r = 0; r < E; r++) {
+                double v = 0;
+                for (uint32_t k = 0; k < F; k++)
+                    v += (double)(_Float16)(float)dw[((uint64_t)e*E+r)*DF+k]*
+                         (double)(_Float16)mid[((uint64_t)t*NO+s)*F+k];
+                got[n] = part[((uint64_t)t*NO+s)*E+r]; ref[n++] = v;
+            }
+        }
+    }
+    char name[96];
+    snprintf(name,sizeof(name),"half expert reference type=%u/%u T=%u",type,dtype,T);
+    check_close(name,got,ref,n,3e-5);
+    free(mid); free(part); free(sel); free(x); free(gw); free(uw); free(dw);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gl);
+    ds4_gpu_tensor_free(gc); ds4_gpu_tensor_free(gm); ds4_gpu_tensor_free(gp);
+}
+#endif
+
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
@@ -3120,6 +3209,8 @@ int main(void) {
     test_attn_mm(8, 128, false);
     test_attn_mm(9, 128, false);
     test_gdn(&arena, 2, 6, 32, 7);
+    test_gdn(&arena, 2, 6, 64, 9);
+    test_gdn(&arena, 2, 6, 96, 17);
     printf("ple\n");
     test_ple(&arena, 2560, 3);
     test_ple(&arena, 64, 12);
@@ -3156,6 +3247,25 @@ int main(void) {
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
+#ifndef __APPLE__
+    test_half_expert_tiles(&arena,33,16,10);
+    test_half_expert_tiles(&arena,2049,16,10);
+    test_half_expert_tiles(&arena,8193,16,10);
+    test_half_expert_tiles(&arena,33,12,39);
+    test_half_expert_tiles(&arena,2049,12,39);
+    test_half_expert_tiles(&arena,8193,12,39);
+    test_dense_mm(&arena, 2560, 100, 37, 8u);
+    test_dense_mm(&arena, 10240, 1700, 32, 8u);
+    test_dense_mm(&arena, 32, 7, 1, 8u);
+    test_dense_mm(&arena, 96, 9, 1, 8u);
+    test_dense_mm(&arena, 68, 9, 1, 1u);
+    test_dense_mm(&arena, 67, 7, 1, 1u);
+    for (uint32_t T = 2; T <= 8; T++) {
+        test_dense_mm(&arena, 96, 9, T, 8u);
+        test_dense_mm(&arena, 68, 9, T, 1u);
+        test_dense_mm(&arena, 67, 7, T, 1u);
+    }
+#endif
     test_dense_mm(&arena, 64, 32, 70, 0u);
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);
