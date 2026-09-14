@@ -59,15 +59,14 @@ needed, and ordinary decode remains the default.
 
 ## Qwen3.8: built-in MTP
 
-The `qwen38-q4k` download contains one combined main/MTP GGUF and a required
-external PLE sidecar. There is no separate non-MTP model download:
+Both Qwen downloads include MTP and native BF16 n-grams in the main GGUF:
 
 ```sh
 ./download_model.sh qwen38-q4k
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+./ds4 --mtp
 ```
 
-Ordinary decode uses the same files with `--mtp` omitted. For non-zero
+Ordinary decode uses the same file with `--mtp` omitted. For non-zero
 temperature, add `--mtp-exact-sampling` to preserve the target sampling
 distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for the Metal runtime.
 

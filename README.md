@@ -175,19 +175,19 @@ and setup.
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Qwen3.8's smaller Q2 release uses a **41.73 GiB** combined main/MTP GGUF,
-with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections. It saves
-11% over the previous Q2 release and is the starting option for 64 GB Macs.
-The required external PLE sidecar is about 29.80 GiB on disk; its resident
-pages and context buffers also consume RAM. Start with 8K context:
+Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
+with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
+It is the starting option for 64 GB Macs.
+The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
+from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
 
 ```sh
 ./download_model.sh qwen38-q2
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024
+./ds4 --ctx 8192 --prefill-chunk 1024
 ```
 
-The download fetches both required files and updates `ds4flash.gguf` to the
-combined model. Add `--mtp` for speculative decoding. The larger
+The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
+Add `--mtp` for speculative decoding. The larger
 `qwen38-q4k` target is also available. Download the optional vision encoder
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.

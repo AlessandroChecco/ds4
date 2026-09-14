@@ -185,7 +185,7 @@ the activation captures.
 
 ## Qwen3.8 Flash Next
 
-Qwen needs the external PLE sidecar. Capture uses `--think` / `--nothink`
+Capture uses `--think` / `--nothink`
 (not `--think-high`). Dumps track the prompt phase explicitly, including
 one-token tails, and retain the last prompt token during ordinary and MTP
 decode. `attn_out` captures the output projection of both GDN and full-attention
@@ -195,8 +195,7 @@ layers, giving one row for each of the 48 trunk layers:
 python3 dir-steering/tools/build_direction.py \
   --profile qwen3.8-flash-next \
   --ds4 ./ds4 \
-  --model gguf/Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf \
-  --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf \
+  --model gguf/Qwen3.8-Flash-Next-Q4.gguf \
   --good-file /path/to/target-prompts.txt \
   --bad-file /path/to/control-prompts.txt \
   --out dir-steering/out/qwen38-direction.json \

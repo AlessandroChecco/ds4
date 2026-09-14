@@ -119,23 +119,24 @@ to build the GGUFs from safetensors.
 
 ## Qwen3.8 Flash Next
 
-`./download_model.sh qwen38-q2` downloads the **41.73 GiB** combined main/MTP
-GGUF from [the DS4 IQ2 release](https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2)
-and reuses the required **29.80 GiB** Q4_1 PLE sidecar from the Q4 repository.
+`./download_model.sh qwen38-q2` downloads one **137.10 GiB** GGUF: 41.73 GiB
+of main/MTP weights and 95.37 GiB of original BF16 n-grams kept on disk.
 Its gate/up experts use IQ2_XXS; down experts use Q2_K with 640 logical inputs
 padded to 768 in the weight file. It replaces the larger MXFP4-down IQ2 release.
-For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; resident
-PLE pages and runtime allocations add to the main weights.
-The larger `qwen38-q4k` target remains available (about 100 GiB total on disk).
+For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; runtime
+allocations add to the main weights, but the n-gram table is not mapped or
+preloaded. Keep the GGUF on a fast local SSD.
+The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
+resident weights, before runtime buffers.
 This model runs on Metal.
 The script links `ds4flash.gguf` to the combined GGUF:
 
 ```sh
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024
+./ds4 --ctx 8192 --prefill-chunk 1024
 ```
 
-Add `--mtp` for speculation; both modes use the same model and sidecar.
-Adjust the PLE path if you set `DS4_GGUF_DIR`. See [Qwen setup](QWEN38_FLASH_NEXT.md)
+Add `--mtp` for speculation; no second file is needed.
+See [Qwen setup](QWEN38_FLASH_NEXT.md)
 for memory, conversion, vision, and sampling details.
 
 Vision uses a separate encoder. `./download_model.sh qwen38-vision` downloads
@@ -240,7 +241,7 @@ The text GGUF stays the same. Download and add the encoder explicitly:
 
 ```sh
 ./download_model.sh qwen38-vision
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp \
+./ds4 --mtp \
   --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
 ```
 

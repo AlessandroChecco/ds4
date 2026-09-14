@@ -5,9 +5,7 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
-# Qwen3.8 DS4 releases; the Q4 repository also hosts the shared PLE sidecar.
-QWEN38_REPO="ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4"
-QWEN38_Q2_REPO="ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2"
+QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
@@ -38,9 +36,8 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
-QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf"
-QWEN38_Q2_MTP_FILE="Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf"
-QWEN38_PLE_FILE="Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
+QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -201,22 +198,19 @@ Targets:
        with --vision; this target does not update ./ds4flash.gguf.
 
   qwen38-q2 (alias: qwen38-iq2)
-       Qwen3.8-Flash-Next DS4 Q2: 41.73 GiB combined main/MTP GGUF,
-       plus the required ~29.80 GiB external PLE sidecar from the Q4 repo.
+       Qwen3.8-Flash-Next Q2: one 137.10 GiB GGUF. Main/MTP weights
+       occupy 41.73 GiB; original BF16 n-grams stay on disk.
        Imatrix IQ2_XXS gate/up and Q2_K down experts (640 logical inputs,
        padded to 768 on disk), with higher-precision dense/control tensors.
        Smaller option for 64 GB Macs: start with --ctx 8192 and
-       --prefill-chunk 1024; context and resident PLE pages also use memory.
-       Requires the current Qwen runtime. Use --ple; --mtp is optional.
+       --prefill-chunk 1024. Context buffers need additional RAM.
+       Keep the file on a local SSD. Add --mtp for speculation.
 
   qwen38-q4k
-       Qwen3.8-Flash-Next DS4 Q4_K imatrix build: one combined main/MTP
-       GGUF and the external PLE n-gram sidecar — about 107 GB (100 GiB)
-       on disk together. Routed gate/up experts are imatrix Q4_K,
-       routed down MXFP4, dense Q8_0. Use --ple at runtime; the same
-       GGUF supports ordinary decode or optional speculation with --mtp
-       (--mtp-exact-sampling for exact sampling under speculation).
-       Fits 128 GB Macs (~68 GiB resident).
+       Qwen3.8-Flash-Next Q4: one 165.11 GiB GGUF. Main/MTP weights
+       occupy 69.74 GiB; original BF16 n-grams stay on disk.
+       Imatrix Q4_K gate/up and MXFP4 down routed experts. Fits 128 GB
+       Macs with room for context buffers. Add --mtp for speculation.
 
   qwen38-vision
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
@@ -237,13 +231,13 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-Qwen3.8 also requires its PLE sidecar; add --mtp to enable speculation:
-  ./ds4 --ple <download directory>/$QWEN38_PLE_FILE --mtp
+Qwen3.8 includes its n-grams and MTP; add --mtp to enable speculation:
+  ./ds4 --mtp
 
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
-PRO, V4.1 and GLM files use the official Hugging Face downloader
+PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -368,14 +362,13 @@ case "$MODEL" in
         LINK_MODEL=0
         ;;
     qwen38-q2|qwen38-iq2)
-        REPO=$QWEN38_Q2_REPO
-        MODEL_FILE=$QWEN38_Q2_MTP_FILE
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q2_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     qwen38-q4k)
         REPO=$QWEN38_REPO
-        MODEL_FILE=$QWEN38_Q4K_MTP_FILE
-        MODEL_FILES="$MODEL_FILE $QWEN38_PLE_FILE"
+        MODEL_FILE=$QWEN38_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     qwen38-vision)
@@ -456,6 +449,14 @@ local_download_name() {
 
 artifact_identity() {
     case "$1" in
+        "$QWEN38_Q2_FILE")
+            expected_bytes=147207127040
+            expected_sha=b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9
+            ;;
+        "$QWEN38_Q4_FILE")
+            expected_bytes=177280286720
+            expected_sha=680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a
+            ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
             expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
@@ -680,12 +681,6 @@ else
     download_one "$MODEL_FILE"
 fi
 
-# Q2 reuses the same PLE file as Q4, without duplicating it on the Hub.
-# Isolate REPO and the downloader's temporary variables from model linking.
-if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
-    (REPO=$QWEN38_REPO; download_one "$QWEN38_PLE_FILE")
-fi
-
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly:"
@@ -707,16 +702,14 @@ fi
 echo
 echo "Done."
 if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
-    echo "Run with the required PLE sidecar and an 8K starting context:"
-    printf '  ./ds4 --ple "%s/%s" --ctx 8192 --prefill-chunk 1024\n' "$OUT_DIR" "$QWEN38_PLE_FILE"
+    echo "Run with an 8K starting context:"
+    echo "  ./ds4 --ctx 8192 --prefill-chunk 1024"
     echo "Add --mtp to enable speculation."
 elif [ "$MODEL" = qwen38-q4k ]; then
-    echo "Run with the required PLE sidecar (omit --mtp for ordinary decode):"
-    printf '  ./ds4 --ple "%s/%s" --mtp\n' "$OUT_DIR" "$QWEN38_PLE_FILE"
+    echo "Run ./ds4. Add --mtp to enable speculation."
 fi
 if [ "$MODEL" = qwen38-vision ]; then
     echo
     echo "Qwen3.8 vision encoder downloaded. Pass it with --vision, for example:"
-    printf '  ./ds4 --ple "%s/%s" --mtp --vision "%s/%s"\n' \
-        "$OUT_DIR" "$QWEN38_PLE_FILE" "$OUT_DIR" "$QWEN38_VISION_FILE"
+    printf '  ./ds4 --vision "%s/%s"\n' "$OUT_DIR" "$QWEN38_VISION_FILE"
 fi

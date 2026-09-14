@@ -81,8 +81,7 @@ unless every final full-vocabulary logit row is bit-identical. Defaults are an
 8192-token prefix, an automatically sized 8193-token context, and two repeats;
 use `--help` to override them.
 
-For Qwen packs with an external PLE table, pass `--ple PATH`. Numeric runtime
-tuning controls can use `--candidate-value TEXT` (default `1`), and
+Numeric runtime tuning controls can use `--candidate-value TEXT` (default `1`), and
 `--prefill-chunk N` selects the same chunk size for both variants (default
 4096). The control unsets the named variable. Use only controls read at
 dispatch time: this harness keeps one engine alive and cannot compare settings

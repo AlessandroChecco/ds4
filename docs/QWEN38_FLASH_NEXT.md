@@ -4,25 +4,35 @@
 
 Qwen3.8-Flash-Next uses the `qwen4exp` GGUF architecture and a dedicated
 Metal graph with gated delta-net, gated GQA, block-sparse attention,
-hyper-connections, per-layer n-gram embeddings (PLE), MoE, and MTP.
+hyper-connections, n-gram embeddings, MoE, and MTP.
 
 ## Download and run
 
 ```sh
 make
 ./download_model.sh qwen38-q2
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024
+./ds4 --ctx 8192 --prefill-chunk 1024
 ```
 
-The download installs a combined main/MTP model (41.73 GiB) and a required
-external Q4_1 PLE table (29.80 GiB), and updates `ds4flash.gguf`.
-The Q2 model uses IQ2_XXS gate/up experts and Q2_K down projections padded
-from 640 to 768 columns. `qwen38-q4k` downloads the larger Q4_K option.
-Adjust the PLE path when using `DS4_GGUF_DIR`. Resident PLE pages and runtime
-buffers consume additional memory; start with the context and chunk above
-on a 64 GB machine.
+The download installs one GGUF containing the main model, MTP and original
+BF16 n-grams, and updates `ds4flash.gguf`:
 
-Use the same model and PLE options with `ds4-agent`, `ds4-server`, or
+| Target | File size | Resident weights |
+| --- | ---: | ---: |
+| `qwen38-q2` | 137.10 GiB | 41.73 GiB |
+| `qwen38-q4k` | 165.11 GiB | 69.74 GiB |
+
+The 95.37 GiB n-gram table stays on disk. The runtime reads selected rows
+directly from the GGUF, without mapping or preloading the table. Keep the
+file on a fast local SSD. No sidecar or n-gram option is needed.
+
+The Q2 model uses IQ2_XXS gate/up experts and Q2_K down projections padded
+from 640 to 768 columns, calibrated with an imatrix. Q4 uses calibrated
+Q4_K gate/up and MXFP4 down experts. Context and runtime buffers still need
+RAM beyond the resident weights; start Q2 with the context and chunk above
+on a 64 GB machine. Q4 needs a larger machine.
+
+Use the same model options with `ds4-agent`, `ds4-server`, or
 `ds4-bench`. Add `--mtp` for speculative decoding using the built-in MTP
 weights. `--nothink` disables thinking. The server exposes
 `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`, and
@@ -34,16 +44,14 @@ replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
 longer contexts, with a possible quality cost on shorter prompts.
 
-PLE is demand-paged when memory is tight and prefetched when installed RAM
-covers the resident model, sidecar, and a 16 GiB margin.
-`DS4_QWEN4_PLE_PREFETCH_FULL=0` or `=1` overrides that choice.
-
 ## Conversion
 
 See [GGUF conversion](../gguf-tools/README.md) for conversion from the HF
 checkpoint and calibrated low-bit expert quantization.
 `gguf-tools/qwen4_pack_to_qwen4exp.py` migrates old DS4 fast packs to the
-active `qwen4exp` schema. Its shared pack modules remain conversion dependencies.
+active `qwen4exp` schema. Finish older main-only conversions with
+`gguf-tools/qwen4_native_ngrams.py`, using the original HF n-gram shards.
+Expanding an old quantized table to BF16 does not restore its lost precision.
 
 ## Vision
 
@@ -94,7 +102,7 @@ decode, use two different PNG or JPEG images with the model-backed regression:
 ```sh
 make ds4
 uv run tests/test_qwen4_cli_vision.py --model /path/to/main-with-mtp.gguf \
-  --ple /path/to/ple.gguf --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
+  --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
   --image /path/to/first.png --image /path/to/second.png
 ```
 
@@ -104,7 +112,7 @@ the responses and diagnostics for inspection; it does not grade image content.
 
 Metal only for now. The Metal graph accepts Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
-hyper-connection mixers and a Q8_0/Q4_0/MXFP4/F16/F32 n-gram table.
+hyper-connection mixers and the original BF16 n-gram table.
 Tensor parallelism, pipeline execution, and SSD expert streaming are not
 implemented for this model yet. CPU code is a correctness reference, not a
 general inference backend.
@@ -115,12 +123,17 @@ general inference backend.
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse test-q8-prefill-variants
 make test-frontends
+make test-qwen4-ngrams
+make tests/test_qwen4_ngram_state
 make -B -C gguf-tools quants-shared
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
+python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
 ```
 
 The kernel tests exercise the active Metal API. Vision and end-to-end model
 checks additionally require the checkpoints described above.
+Run `tests/test_qwen4_ngram_state MODEL.gguf` under Metal validation to check
+failed disk reads during prefill, decode and MTP, then exact recovery.
 
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.
@@ -129,16 +142,16 @@ Qwen prefill checkpoints include matching logits at each completed chunk,
 including cancellation frontiers. To test save/restore and continuation:
 
 ```sh
-DS4_TEST_MODEL=/path/to/main-with-mtp.gguf DS4_TEST_PLE=/path/to/ple.gguf \
+DS4_TEST_MODEL=/path/to/main-with-mtp.gguf \
   DS4_TEST_GLM_MTP=1 DS4_TEST_MTP_EXACT=1 \
   ./ds4_test --qwen4-prefill-checkpoints --qwen4-restore-reuse \
     --session-snapshot --session-rewind --session-rewind-resample
 python3 tests/test_qwen4_checkpoint_replay.py \
-  --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
+  --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_mtp_limits.py \
-  --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
+  --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_logit_dump.py \
-  --model /path/to/main-with-mtp.gguf --ple /path/to/ple.gguf
+  --model /path/to/main-with-mtp.gguf
 ```
 
 The server regression checks continued disk saves, cache-budget eviction,
@@ -151,17 +164,15 @@ the next checkpoint uses the visible history key for restart reuse.
 The MTP tests cover small prefill buffers, rewinds, reused sessions, and
 truncated checkpoints. The logit-dump test requires NumPy and compares all-row
 prefill with teacher-forced decode across a chunk boundary. For official
-continuation scoring, pass `--ple` to `score_official`; use `--rendered-prompt`
+continuation scoring, use `--rendered-prompt`
 when a fixture already contains the complete model chat template.
 
 Qwen directional steering and activation capture support all 48 trunk layers;
 see [directional steering](../dir-steering/README.md). Model-backed regressions:
 
 ```sh
-python3 tests/test_qwen4_steering.py --model /path/to/main-with-mtp.gguf \
-  --ple /path/to/ple.gguf
-DS4_TEST_PLE=/path/to/ple.gguf \
-  ./ds4_agent_test --full-context-save /path/to/main-with-mtp.gguf
+python3 tests/test_qwen4_steering.py --model /path/to/main-with-mtp.gguf
+./ds4_agent_test --full-context-save /path/to/main-with-mtp.gguf
 make test-web-recovery
 ```
 
