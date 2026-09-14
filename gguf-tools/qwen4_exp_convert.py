@@ -5,7 +5,8 @@ Wraps llama.cpp's conversion package, so the file keeps the upstream
 `qwen4exp` schema, and adds the MTP block as the trailing blk.<n_layer>
 (nextn.* tensors plus `qwen4exp.nextn_predict_layers`); --no-mtp leaves it
 out for stock llama.cpp.  Norms, conv kernels, ssm_a, dt biases and the
-routers stay F32; the other tensor types follow the options below.
+routers stay F32; the other tensor types follow the options below. N-grams
+retain their original BF16 bytes at the end of the file for disk-only reads.
 
 Needs a llama.cpp master checkout (--llama-cpp or $LLAMA_CPP) and a Python
 with torch, safetensors and transformers.  The output is written to
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -25,13 +27,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", required=True, help="HF checkpoint directory")
     ap.add_argument("--out", required=True, help="output GGUF path")
+    ap.add_argument("--source-revision", required=True, help="pinned HF checkpoint commit SHA")
     ap.add_argument("--outtype", default="q8_0", choices=["q8_0", "f32"], help="type of the dense projections")
     ap.add_argument("--experts", default=None, choices=["q8_0", "mxfp4", "q4_k", "f32"],
                     help="routed expert type (default: follows --outtype)")
     ap.add_argument("--experts-down", default=None, choices=["q8_0", "mxfp4", "f32"],
                     help="down_exps type when --experts needs 256-wide rows (default: q8_0, or mxfp4 with --experts mxfp4)")
-    ap.add_argument("--ngram", default=None, choices=["q8_0", "mxfp4", "q4_0", "f32"],
-                    help="PLE n-gram table type (default: follows --outtype)")
     ap.add_argument("--hc-type", default=None, choices=["f16", "f32", "q8_0"],
                     help="hyper-connection down/up/inject type (default: f16, or f32 with --outtype f32)")
     ap.add_argument("--indexer", default=None, choices=["bf16", "f16", "q8_0", "f32"],
@@ -56,12 +57,11 @@ def main() -> None:
 
     Q = gguf.GGMLQuantizationType
     T = gguf.MODEL_TENSOR
-    type_of = {"q8_0": Q.Q8_0, "mxfp4": Q.MXFP4, "q4_k": Q.Q4_K, "q4_0": Q.Q4_0,
+    type_of = {"q8_0": Q.Q8_0, "mxfp4": Q.MXFP4, "q4_k": Q.Q4_K,
                "f16": Q.F16, "bf16": Q.BF16, "f32": Q.F32}
     all_f32 = args.outtype == "f32"
     experts_t = type_of[args.experts or args.outtype]
     experts_down_t = type_of[args.experts_down or ("mxfp4" if args.experts == "mxfp4" else args.outtype)]
-    ngram_t = type_of[args.ngram or args.outtype]
     hc_t = type_of[args.hc_type or ("f32" if all_f32 else "f16")]
     indexer_t = type_of[args.indexer or ("f32" if all_f32 else "bf16")]
     keep_mtp = not args.no_mtp
@@ -77,6 +77,16 @@ def main() -> None:
         no_mtp = not keep_mtp
         supports_mtp_export = False
         _MIXER = "mtp.hyper_connection_mixer."
+
+        def _place_ple_shard(self, data_torch, name):
+            # Leave table payloads to the bounded, byte-preserving final packer.
+            idx = int(name.rpartition(".shard_")[2].partition(".")[0])
+            self._ple_shards[idx] = name
+            width = int(data_torch.shape[-1])
+            if self._ple_row_dim is not None and self._ple_row_dim != width:
+                raise ValueError("Inconsistent n-gram row width")
+            self._ple_row_dim = width
+            return []
 
         @classmethod
         def filter_tensors(cls, item):
@@ -130,8 +140,6 @@ def main() -> None:
         def tensor_force_quant(self, name, new_name, bid, n_dims):
             if n_dims <= 1 or new_name.endswith(("conv1d.weight", "ssm_a", "_norm.weight")):
                 return Q.F32
-            if new_name == "per_layer_token_embd.weight":
-                return ngram_t
             for key in (T.FFN_GATE_EXP, T.FFN_UP_EXP):
                 if self.match_model_tensor_name(new_name, key, bid):
                     return experts_t
@@ -154,13 +162,19 @@ def main() -> None:
     ftype = gguf.LlamaFileType.ALL_F32 if all_f32 else gguf.LlamaFileType.MOSTLY_Q8_0
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + ".incomplete")
+    tmp = out.with_name(out.name + ".main.incomplete")
+    if out.exists() or tmp.exists() or Path(str(out) + ".incomplete").exists():
+        sys.exit("Output already exists; inspect it or choose a new path")
+    if not re.fullmatch('[0-9a-f]{40}', args.source_revision):
+        sys.exit("--source-revision must be an immutable 40-character commit SHA")
 
     model = DS4Qwen4ExpModel(Path(args.src), ftype, tmp, use_temp_file=False, dry_run=args.dry_run)
     model.write()
     if args.dry_run:
         return
-    os.replace(tmp, out)
+    from qwen4_native_ngrams import repack
+    repack(tmp, Path(args.src), out, args.source_revision)
+    tmp.unlink()
     print(f"wrote {out} ({out.stat().st_size / 1e9:.2f} GB)")
 
 

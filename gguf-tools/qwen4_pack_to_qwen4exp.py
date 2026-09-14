@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert a Qwen3.8-Flash-Next fast-pack (ds4.qwen4.fast-pack v3, `qwen4-exp`
-split artifacts) into the single-file `qwen4exp` GGUF schema ds4 loads.
+split artifacts) into `qwen4exp` main weights.
 
 Reads the pack base GGUF (upstream HF tensor names, Q4_0 routed experts,
 BF16 control/embeddings, Q8_0 dense) and the external Q4_1 PLE sidecar, and
@@ -12,9 +12,11 @@ writes one GGUF with llama.cpp-schema names, KV keys, and weight layout:
     qk projection splits into q_proj/k_proj rows.
   - GDN per-head vectors and alpha/beta rows are permuted into the tiled
     v-head order (v-head j pairs with k-head j % n_k_heads).
-  - The PLE n-gram table is dequantized Q4_1 -> F16 and inlined as
-    per_layer_token_embd.weight.
-  - No MTP block is emitted; the engine trims the profile to the trunk.
+  - The old n-gram sidecar supplies only hash metadata, never table values.
+  - --mtp includes the original pack's MTP block when supplied.
+
+Finish the output with qwen4_native_ngrams.py and original BF16 source shards
+before inference. The quantized sidecar cannot recover the original values.
 
 Every transform was verified numerically against the official ggml-org Q8_0
 GGUF built from the same checkpoint by llama.cpp (ssm_a permutation 144/144,
@@ -456,38 +458,6 @@ def prod_eh_proj(src):
     return p
 
 
-PLE_CHUNK_ROWS = 4_000_000
-
-
-def prod_ple(ple_name):
-    def p(b, ple, out):
-        t, dims, off = ple.tensors[ple_name]
-        assert t == T_Q4_1 and dims[0] == 160, (t, dims)
-        n_rows = dims[1]
-        blocks_per_row = dims[0] // 32              # 5
-        ple.f.seek(ple.data_start + off)
-        written = 0
-        for start in range(0, n_rows, PLE_CHUNK_ROWS):
-            n = min(PLE_CHUNK_ROWS, n_rows - start)
-            raw = np.frombuffer(ple.f.read(n * blocks_per_row * 20), dtype=np.uint8)
-            blocks = raw.reshape(n * blocks_per_row, 20)
-            d = blocks[:, 0:2].copy().view("<f2").astype(np.float32).reshape(-1, 1)
-            m = blocks[:, 2:4].copy().view("<f2").astype(np.float32).reshape(-1, 1)
-            qs = blocks[:, 4:]
-            lo = (qs & 0x0F).astype(np.float32)
-            hi = (qs >> 4).astype(np.float32)
-            outv = np.empty((n * blocks_per_row, 32), dtype="<f2")
-            outv[:, :16] = d * lo + m
-            outv[:, 16:] = d * hi + m
-            out.write(outv.tobytes())
-            written += outv.nbytes
-            print(f"\r  PLE {start + n}/{n_rows} rows ({written / 1e9:.1f} GB)",
-                  end="", flush=True)
-        print()
-        return written
-    return p
-
-
 # --------------------------------------------------------------------------
 # output plan
 
@@ -729,9 +699,10 @@ SCALAR_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8
 
 
 def kv_bytes(k, t, v) -> bytes:
-    out = w_str(k) + struct.pack("<I", t)
+    out = bytearray(w_str(k) + struct.pack("<I", t))
     if t == 8:
-        return out + w_str(v)
+        out.extend(w_str(v))
+        return bytes(out)
     if t == 9:
         out += struct.pack("<I", v.item_type) + struct.pack("<q", len(v.values))
         for x in v.values:
@@ -739,16 +710,13 @@ def kv_bytes(k, t, v) -> bytes:
                 out += w_str(x)
             else:
                 out += struct.pack(SCALAR_FMT[v.item_type], x)
-        return out
-    return out + struct.pack(SCALAR_FMT[t], v)
+        return bytes(out)
+    out.extend(struct.pack(SCALAR_FMT[t], v))
+    return bytes(out)
 
 
-def write_gguf(path, kv, plan, base, ple, ple_external=False):
-    ple_rows = base.kv["qwen4-exp.ple.row_count"]
+def write_gguf(path, kv, plan, base, ple):
     ordered = list(plan)
-    if not ple_external:
-        ordered.append(("per_layer_token_embd.weight", T_F16, [160, ple_rows],
-                        prod_ple("ple.weight")))
 
     infos = []
     off = 0
@@ -803,13 +771,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", required=True)
-    ap.add_argument("--ple", required=True)
+    ap.add_argument("--ple", required=True, help="old pack sidecar, used only for hash metadata")
     ap.add_argument("--out", required=True)
     ap.add_argument("--mtp", default=None,
                     help="MTP sidecar GGUF (qwen4-exp-mtp); adds the blk.48 nextn block")
-    ap.add_argument("--ple-external", action="store_true",
-                    help="omit the inlined per_layer_token_embd.weight; the engine "
-                         "reads the table from the --ple sidecar GGUF (--ple)")
     args = ap.parse_args()
 
     base = Reader(args.base)
@@ -824,9 +789,10 @@ def main():
     pack_names = set(base.tensors)
     # map producers back to their source names via closure inspection is
     # fragile; instead count coverage by size accounting at write time.
-    print(f"plan: {len(plan)} tensors + PLE; pack base has {len(pack_names)} tensors")
+    print(f"plan: {len(plan)} main/MTP tensors; pack base has {len(pack_names)} tensors")
     kv = build_kv(base, ple, mtp)
-    write_gguf(args.out, kv, plan, base, ple, args.ple_external)
+    write_gguf(args.out, kv, plan, base, ple)
+    print("Finish with qwen4_native_ngrams.py and the original BF16 source before inference.")
 
 
 if __name__ == "__main__":

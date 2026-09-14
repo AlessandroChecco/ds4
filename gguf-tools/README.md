@@ -16,7 +16,7 @@ The important pieces are:
 
 ## Qwen3.8 IQ2_XXS experiment
 
-`qwen4_iq2.py` builds a mixed IQ2_XXS/MXFP4 model with external PLE and
+`qwen4_iq2.py` builds mixed IQ2_XXS/MXFP4 main weights with
 embedded MTP. It quantizes the 48 trunk layers' gate/up experts directly from
 the official BF16 checkpoint using the same pinned imatrix as the Q4_K pack.
 It then copies every other tensor from an existing combined Q4_K `qwen4exp`
@@ -45,11 +45,11 @@ assembly. Repeating the first command verifies completed tensors before
 resuming. Assembly refuses existing outputs and verifies every written tensor
 before publishing the completed GGUF and its JSON manifest.
 
-The main model is approximately 50.3 GB, excluding the required external PLE
-sidecar and runtime allocations. Use the same Q4_1 PLE sidecar as the Q4_K
-model. Quantization changes model outputs; fitting the weights on disk does
-not establish a 64 GB runtime fit or acceptable reasoning quality. Compare
-with the same evaluator settings using `ds4-eval --suite hard --ple FILE`.
+The intermediate main model is approximately 50.3 GB. Finish it with the
+[native n-gram packer](#native-qwen-n-grams) before inference. Quantization
+changes model outputs; fitting weights on disk does not establish a 64 GB
+runtime fit or acceptable reasoning quality. Compare with the same evaluator
+settings using `ds4-eval --suite hard`.
 ### Experimental padded Q2_K down projections
 
 Use `--projection down` on both stages to quantize the 48 trunk down
@@ -77,6 +77,32 @@ physical dimensions `[768, 2560, 512]`; the architecture's expert width remains
 The shared expert and MTP retain their original dimensions and formats.
 Saving 88 bytes per trunk down row reduces the main model by 5.15625 GiB;
 quality and speed must be evaluated for this new recipe.
+
+### Native Qwen n-grams
+
+Finish main-only packs with the original BF16 n-gram shards, not the old
+quantized sidecar:
+
+```sh
+python3 gguf-tools/qwen4_native_ngrams.py \
+  --model /path/to/IQ2XXSImatrix-Q2KDownPad768-MTP.gguf \
+  --source /path/to/Qwen3.8-Flash-Next \
+  --source-revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
+  --output gguf/Qwen3.8-Flash-Next-Q2.gguf
+```
+
+The source directory needs its index and the safetensors shards containing
+`ple.ple_embedding` tensors. The packer checks the hash constants, copies all
+main/MTP tensor bytes unchanged, and appends the original BF16 table at a
+page-aligned offset. It verifies every copied payload before publishing the
+file and its checksum report. Allow space for the complete new file plus
+16 GiB spare. An incomplete output is never a runnable release artifact.
+
+For the Q4 pack, use its main GGUF as `--model`. `--source` can also be a
+previously verified native n-gram GGUF from the same pinned checkpoint.
+This avoids keeping a second copy of the original safetensors. The final
+Q2 and Q4 files include 95.37 GiB of disk-only n-grams; no table precision
+is lost, and the main-model quantization is unchanged.
 
 ## Build
 
@@ -307,18 +333,21 @@ transformers, such as llama.cpp's own venv:
 
 ```sh
 python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --source-revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
   --out Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0
 python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --source-revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
   --out Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4
 ```
 
 Options: `--outtype q8_0|f32` (dense projections), `--experts
 q8_0|mxfp4|q4_k|f32` (routed experts; `--experts-down` picks the 640-wide down
-projection type when the gate/up type needs 256-wide rows), `--ngram
-q8_0|mxfp4|q4_0|f32` (the per-layer n-gram table), `--hc-type f16|f32|q8_0`
+projection type when the gate/up type needs 256-wide rows), `--hc-type f16|f32|q8_0`
 (hyper-connection mixers), `--indexer bf16|f16|q8_0|f32` (the QSA indexer
 projections, kept at the released BF16 by default), `--no-mtp` and
 `--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
+N-grams always retain the original BF16 bytes. The converter finishes through
+the native packer above; its temporary main-weight file is removed on success.
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
 
