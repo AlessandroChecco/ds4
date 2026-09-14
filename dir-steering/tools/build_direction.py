@@ -10,6 +10,8 @@ At runtime ds4 applies:
 Positive scale suppresses the target direction.  Negative scale amplifies it.
 """
 
+from __future__ import annotations
+
 import argparse
 import array
 import json
