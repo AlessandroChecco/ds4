@@ -49,6 +49,9 @@
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS4_HAS_QWEN4_METAL 1
+#endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
@@ -6954,7 +6957,7 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
         fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
                 factor, native_ctx, low, high, g_qwen4_rope_mscale);
     }
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
     ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, half, g_qwen4_rope_mscale);
 #endif
 }
@@ -7513,6 +7516,7 @@ static void qwen4_vision_weights_bind(ds4_qwen4_vision_weights *w, const ds4_mod
     }
 }
 
+#ifdef DS4_HAS_QWEN4_METAL
 /* Learned 2D position table (side x side) resampled to the patch grid with
  * bilinear, align_corners interpolation; rows in 2x2 window order. */
 static void qwen4_vision_pos_embed(const float *table, uint32_t side, uint32_t n_embd,
@@ -7575,6 +7579,7 @@ static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision
     *out = emb;
     return 1;
 }
+#endif
 #endif
 
 static void weights_bind_output(
@@ -39578,7 +39583,12 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
-static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx);
+static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
+    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
@@ -57367,7 +57377,7 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     *count = n;
     return spans;
 }
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next Metal graph.  One command batch per forward; f32
  * transients sized for cap_tokens rows so the same kernels serve decode
@@ -57458,16 +57468,6 @@ typedef struct {
     float steer_ffn_scale;
     bool dump_prompt_rows;
 } ds4_qwen4_gpu_graph;
-
-/* prefill chunk: DS4_QWEN4_PREFILL_CHUNK overrides the 8192-token default
- * (expert weights are read once per chunk; the transient buffers scale with it) */
-static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
-    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
-    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
-    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
-    if (chunk > ctx) chunk = ctx;
-    return chunk;
-}
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
@@ -58866,6 +58866,9 @@ static int generate_qwen4_metal_argmax(
     return 0;
 }
 
+#endif
+
+#ifndef DS4_NO_GPU
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -58898,10 +58901,12 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
         return 1;
     }
+#ifdef DS4_HAS_QWEN4_METAL
     if (ds4_model_is_qwen4()) {
         return generate_qwen4_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size,
                                            emit, done, emit_ud, progress, progress_ud);
     }
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (power_percent > 0 && power_percent < 100) {
             fprintf(stderr, "ds4: --power is not supported by the GLM Metal path yet\n");
@@ -59791,11 +59796,13 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+#ifdef DS4_HAS_QWEN4_METAL
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+#endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
      * pending point-mass draft; sampled decoding discards a draft when its
@@ -62021,11 +62028,13 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     return rc;
 }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
+#endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
-#ifdef DS4_NO_GPU
+#ifndef DS4_HAS_QWEN4_METAL
         return 0;
 #else
         if (!s->qwen4_graph_ready || !s->checkpoint_valid) return 0;
@@ -62172,6 +62181,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
     return 0;
 }
 
+#ifdef DS4_HAS_QWEN4_METAL
 /* Qwen3.8 session payload: header, tokens, logits, then per layer either the
  * GDN state + conv history (linear layers) or the live KV/indexer rows and
  * pooled block keys (attention layers, incl. the MTP block), then the PLE
@@ -62215,7 +62225,6 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
     return bytes;
 }
 
-#ifndef DS4_NO_GPU
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s->qwen4_graph_ready) {
         payload_set_err(err, errlen, "Qwen3.8 graph is not ready for snapshot");
@@ -62414,7 +62423,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {
-#ifdef DS4_NO_GPU
+#ifndef DS4_HAS_QWEN4_METAL
         payload_set_err(err, errlen, "graph backend support is not compiled in");
         return 1;
 #else
@@ -62801,7 +62810,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {
-#ifdef DS4_NO_GPU
+#ifndef DS4_HAS_QWEN4_METAL
         payload_set_err(err, errlen, "graph backend support is not compiled in");
         return 1;
 #else
@@ -67109,6 +67118,7 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
             for (uint32_t j = 0; j < i; j++) used |= sel[j] == (int)e;
             if (!used && (best < 0 || prob[e] > prob[best])) best = (int)e;
         }
+        if (best < 0) ds4_die("Qwen3.8 router selected more experts than available");
         sel[i] = best;
         wsum += prob[best];
     }
@@ -67262,7 +67272,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
      * the whole list. */
     const char *ft_list = getenv("DS4_QWEN4_FT_LIST");
     if (ft_list && ft_list[0]) {
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
         if (!metal || !getenv("DS4_QWEN4_GPU")) {
             fprintf(stderr, "ds4: DS4_QWEN4_FT_LIST needs --metal with DS4_QWEN4_GPU set\n");
             return 1;
@@ -67381,7 +67391,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         qwen4_ref_state_free(&mst);
     }
 
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
     /* DS4_QWEN4_GPU=1 runs the Metal graph over the same ids (chunks of
      * DS4_QWEN4_GPU_CHUNK tokens, default 1) and reports it against the CPU
      * reference; the dumped logits (and MTP drafts) are then the GPU's. */
@@ -70072,6 +70082,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_qwen4() && !opt->inspect_only) {
+        const bool backend_ok =
+#ifdef DS4_HAS_QWEN4_METAL
+            e->backend == DS4_BACKEND_METAL ||
+#endif
+            (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+        if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
+            opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
+            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            (opt->mtp_path && opt->mtp_path[0])) {
+            fprintf(stderr, "ds4: Qwen3.8 requires single-host Metal (or --cpu --first-token-test); "
+                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
+                            "external MTP models and power throttling are not supported\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
@@ -70375,22 +70403,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
-        }
-        if (e->backend != DS4_BACKEND_METAL) {
-            fprintf(stderr, "ds4: Qwen3.8 inference requires the Metal backend\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if ((opt->mtp_path && opt->mtp_path[0]) ||
-            e->ssd_streaming ||
-            e->power_percent < 100) {
-            fprintf(stderr,
-                    "ds4: --mtp-model, SSD streaming and "
-                    "--power are not supported for Qwen3.8\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
         }
     }
 
@@ -71832,7 +71844,7 @@ static int ds4_engine_vision_encode_image(
         layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
         ds4_deepseek4_image_patches_free(&patches);
     } else if (e->vision_kind == DS4_VISION_QWEN4) {
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
         ds4_image_patches patches = {0};
         if (!qwen4_vision_encode_image(&e->vision_model, &e->qwen4_vision_weights, image, 64u,
                                        qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap)) {
@@ -71894,7 +71906,7 @@ static int ds4_engine_vision_encode_image(
 
 int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const char *out_path,
                           uint32_t min_image_tokens, uint32_t max_image_tokens) {
-#ifdef DS4_NO_GPU
+#ifndef DS4_HAS_QWEN4_METAL
     (void)vision_path; (void)image_path; (void)out_path; (void)min_image_tokens; (void)max_image_tokens;
     fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
     return 0;
@@ -72405,6 +72417,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
     if (ds4_model_is_qwen4()) {
         if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
             fprintf(stderr, "ds4: Qwen3.8 sessions are Metal-only, single node for now\n");
@@ -72437,6 +72450,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
         uint32_t layer_start = 0;
@@ -72779,6 +72793,7 @@ void ds4_session_free(ds4_session *s) {
             ds41_graph_free(&s->ds41_graph);
         } else
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
         if (ds4_session_is_qwen4(s)) {
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
@@ -72787,7 +72802,9 @@ void ds4_session_free(ds4_session *s) {
             }
             free(s->qwen4_verify_logits);
             qwen4_graph_free(&s->qwen4_graph);
-        } else if (ds4_session_is_glm(s)) {
+        } else
+#endif
+        if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
             metal_graph_free(&s->graph);
@@ -72875,9 +72892,12 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
     bool loaded = s->engine->directional_steering_dirs != NULL;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
+#ifdef DS4_HAS_QWEN4_METAL
         if (s->qwen4_graph_ready) {
             loaded = s->qwen4_graph.steer_dirs != NULL;
-        } else if (ds4_session_is_glm(s)) {
+        } else
+#endif
+        if (ds4_session_is_glm(s)) {
             const int tier = glm_graph_directional_steering_tier(
                     &s->glm_graph, s->glm_graph.layer_start);
             loaded = tier >= 0 &&
@@ -72896,10 +72916,13 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
     s->engine->directional_steering_ffn_scale = scale;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
+#ifdef DS4_HAS_QWEN4_METAL
         if (s->qwen4_graph_ready) {
             s->qwen4_graph.steer_ffn_scale = scale;
             s->glm_mtp_have = 0;
-        } else if (ds4_session_is_glm(s)) {
+        } else
+#endif
+        if (ds4_session_is_glm(s)) {
             s->glm_graph.directional_steering_ffn_scale = scale;
             s->glm_mtp_have = 0;
             s->glm_mtp_rollback_valid = false;
@@ -73465,6 +73488,7 @@ static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
                                            errlen);
 }
 
+#ifdef DS4_HAS_QWEN4_METAL
 /* after a rewind past the verify snapshot the graph was reset: re-prefill the
  * kept transcript so the state matches the checkpoint again */
 static int qwen4_session_replay_if_stale(ds4_session *s, char *err, size_t errlen) {
@@ -73768,6 +73792,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     accepted[0] = first_token;
     return 1;
 }
+#endif
 #endif
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
@@ -74720,7 +74745,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
         int start = 0;
@@ -76779,6 +76804,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
     if (ds4_session_is_qwen4(s)) {
         if (!s->qwen4_graph_ready) {
             if (errlen) snprintf(err, errlen, "Qwen3.8 graph is not initialized");
@@ -76800,6 +76826,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         (void)probe_mtp;
         return 0;
     }
+#endif
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
@@ -82549,7 +82576,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
                                                 accepted, accepted_cap, err, errlen);
@@ -83416,7 +83443,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         return 1;
     }
     if (ds4_session_is_qwen4(s)) {
-#ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                 s->engine->dspark_exact_sampling,
@@ -83570,6 +83597,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
     bool state_ok = false;
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
     if (s->checkpoint_valid && ds4_session_is_qwen4(s)) {
         /* a verify snapshot can restore the verified block's start (the
          * pre-verify snap0 set, kept for exact-sampling resample rewinds),
@@ -83590,6 +83618,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;
     }
+#endif
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
