@@ -19,10 +19,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     out = out.resolve()
     # Token IDs 1..6 are ordinary vocabulary entries. Cross the 128-row buffer.
-    tokens = [1, 2, 3, 4, 5, 6] * 22
+    tokens = [1, 2, 3, 4, 5, 6] * 23
+    lengths = (6, 132, 136)
     ids = lambda values: ",".join(map(str, values))
     rows = []
-    for length in (6, 132):
+    for length in lengths:
         rows.append(f"{ids(tokens[:length])}\t{out / f'all-{length}.bin'}\n")
         prefix = length - 2
         rows.append(f"{ids(tokens[:prefix])}|{ids(tokens[prefix:length] + [1])}"
@@ -40,7 +41,7 @@ def main():
     (out / "stdout").write_bytes(result.stdout)
     (out / "stderr").write_bytes(result.stderr)
     assert result.returncode == 0, f"dump failed; see {out}"
-    for length in (6, 132):
+    for length in lengths:
         all_rows = np.fromfile(out / f"all-{length}.bin", dtype=np.float32)
         targets = np.fromfile(out / f"target-{length}.bin", dtype=np.float32)
         assert len(all_rows) and len(all_rows) % length == 0
