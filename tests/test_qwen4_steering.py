@@ -42,6 +42,8 @@ def main():
                  f"--dir-steering-{component}", "0.1", "-n", "48"]
         plain = run(component, flags)
         mtp = run(component + "-mtp", flags + ["--mtp", "--mtp-exact-sampling", "--mtp-timing"])
+        for result in (plain, mtp):
+            assert b"Qwen3.8 directional steering enabled:" in result.stderr, result.stderr.decode()
         assert plain.stdout == mtp.stdout, component + " MTP changed greedy output"
         match = re.search(rb"(\d+) verify cycles, (\d+) drafts accepted", mtp.stderr)
         assert match and int(match[1]) > 0 and int(match[2]) > 0, mtp.stderr.decode()

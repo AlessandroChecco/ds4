@@ -58894,6 +58894,9 @@ static int generate_qwen4_metal_argmax(
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
+        const char        * directional_steering_file,
+        float               directional_steering_attn,
+        float               directional_steering_ffn,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -58905,6 +58908,12 @@ static int generate_qwen4_metal_argmax(
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
     if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false)) {
+        free(g);
+        return 1;
+    }
+    if (!qwen4_graph_load_steering(g, directional_steering_file,
+                                  directional_steering_attn, directional_steering_ffn)) {
+        qwen4_graph_free(g);
         free(g);
         return 1;
     }
@@ -58995,6 +59004,8 @@ static int generate_metal_graph_raw_swa(
 #ifdef DS4_HAS_QWEN4_METAL
     if (ds4_model_is_qwen4()) {
         return generate_qwen4_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size,
+                                           directional_steering_file,
+                                           directional_steering_attn, directional_steering_ffn,
                                            emit, done, emit_ud, progress, progress_ud);
     }
 #endif
