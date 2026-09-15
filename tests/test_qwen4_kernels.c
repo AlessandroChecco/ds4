@@ -864,8 +864,8 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
 }
 
 /* prefill attention kernel vs the per-token kernel on the same inputs */
-static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
-    const uint32_t H = 24, Hkv = 2, D = 256, ratio = 4, k_blocks = 6, sel_stride = k_blocks * ratio + ratio;
+static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H) {
+    const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
     const uint32_t cap = pos0 + T;
     const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
     float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
@@ -873,9 +873,11 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(frand() - 0.5f); vc[i] = (_Float16)(frand() - 0.5f); }
     int32_t *sel = malloc((uint64_t)T * sel_stride * 4);
     uint32_t *cnt = malloc(T * 4);
+    uint32_t *blocks = malloc(k_blocks * sizeof(*blocks));
+    require_ok(blocks != NULL, "attention block selection allocation");
     for (uint32_t t = 0; t < T; t++) {
         const uint32_t pos = pos0 + t, n_blocks = (pos + 1) / ratio, nb = n_blocks < k_blocks ? n_blocks : k_blocks;
-        uint32_t blocks[16], n = 0;
+        uint32_t n = 0;
         for (uint32_t i = 0; i < nb; i++) {
             uint32_t b;
             bool dup;
@@ -890,6 +892,19 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
         for (uint32_t k = n_blocks * ratio; k <= pos; k++) sel[(uint64_t)t * sel_stride + n++] = (int32_t)k;
         cnt[t] = n;
     }
+    free(blocks);
+#ifndef __APPLE__
+    for (uint32_t t = 0; t < T; t++) {
+        const float amplitude = t % 3 == 0 ? 64 : t % 3 == 1 ? 0.00001f : 1;
+        for (uint32_t i = 0; i < H * D; i++) q[(uint64_t)t * H * D + i] *= amplitude;
+        if (sparse && t % 7 == 0) cnt[t] = 0;
+        else if (sparse && t % 11 == 1) {
+            cnt[t] = 1;
+            sel[(uint64_t)t * sel_stride] = -1;
+        } else if (sparse && cnt[t] && t + 1 < T)
+            sel[(uint64_t)t * sel_stride] = (int32_t)(pos0 + t + 1);
+    }
+#endif
     ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
     ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
@@ -903,19 +918,75 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
+        require_ok(isfinite(got[i]) && isfinite(ref[i]), "finite attention output");
         const double d = fabs((double)got[i] - ref[i]);
         if (d > worst) worst = d;
         if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
     }
     char name[96];
-    snprintf(name, sizeof(name), "attn mm T=%u pos0=%u %s", T, pos0, sparse ? "sparse" : "dense");
+    snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s", T, H, pos0, sparse ? "sparse" : "dense");
+#ifdef __APPLE__
     require_ok(worst <= 4e-3 * scale, name);
+#else
+    require_ok(worst <= 3e-5 * scale, name);
+    /* Check selected rows against the definition, independently of both GPU
+     * kernels. Include the first, middle and last token and KV head group. */
+    double *scores = malloc((size_t)cap * sizeof(*scores));
+    require_ok(scores != NULL, "attention CPU reference allocation");
+    double cpu_error = 0, scalar_error = 0, cpu_scale = 0;
+    for (uint32_t ti = 0; ti < 3; ti++) for (uint32_t hi = 0; hi < 3; hi++) {
+        const uint32_t t = ti == 0 ? 0 : ti == 1 ? T/2 : T-1;
+        const uint32_t h = hi == 0 ? 0 : hi == 1 ? H/2 : H-1;
+        const uint32_t kh = h/(H/Hkv), n = sparse ? cnt[t] : pos0+t+1;
+        double peak = -INFINITY, denom = 0, acc[256] = {0};
+        for (uint32_t j = 0; j < n; j++) {
+            const uint32_t pos = sparse ? (uint32_t)sel[(uint64_t)t*sel_stride+j] : j;
+            double dot = 0;
+            if (pos > pos0+t) { scores[j] = -INFINITY; continue; }
+            for (uint32_t d = 0; d < D; d++)
+                dot += (double)q[((uint64_t)t*H+h)*D+d] * (double)kc[((uint64_t)pos*Hkv+kh)*D+d];
+            scores[j] = dot * 0.0625;
+            peak = fmax(peak,scores[j]);
+        }
+        for (uint32_t j = 0; j < n; j++) {
+            const uint32_t pos = sparse ? (uint32_t)sel[(uint64_t)t*sel_stride+j] : j;
+            if (pos > pos0+t) continue;
+            const double weight = exp(scores[j]-peak);
+            denom += weight;
+            for (uint32_t d = 0; d < D; d++) acc[d] += weight * (double)vc[((uint64_t)pos*Hkv+kh)*D+d];
+        }
+        for (uint32_t d = 0; d < D; d++) {
+            const uint64_t i = ((uint64_t)t*H+h)*D+d;
+            const double expected = denom > 0 ? acc[d]/denom/(1+exp(-(double)gate[i])) : 0;
+            cpu_error = fmax(cpu_error,fabs((double)got[i]-expected));
+            scalar_error = fmax(scalar_error,fabs((double)ref[i]-expected));
+            cpu_scale = fmax(cpu_scale,fabs(expected));
+        }
+    }
+    free(scores);
+    require_ok(cpu_error <= 3e-5 * fmax(cpu_scale,1e-8), "attention double reference");
+    printf("  %-44s CPU max|d|=%.2e scalar=%.2e (scale %.2e)\n", name, cpu_error, scalar_error, cpu_scale);
+#endif
     if (T <= 8u) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
     printf("  %-44s ok  max|d|=%.2e (scale %.2e)\n", name, worst, scale);
     free(ref); free(got); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
     ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
 }
+
+static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
+    test_attn_mm_keys(T, pos0, sparse, 6, 24);
+}
+
+#ifndef __APPLE__
+static void test_attn_groups(void) {
+    test_attn_mm_keys(32, 4093, false, 6, 24);
+    test_attn_mm_keys(33, 8193, true, 511, 24);
+    test_attn_mm_keys(32, 97, false, 6, 2);
+    test_attn_mm_keys(33, 100, true, 6, 32);
+    test_attn_mm_keys(33, 100, true, 6, 34);
+}
+#endif
 
 /* ---- PLE ---- */
 
@@ -3160,6 +3231,9 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
+#ifndef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+#endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -3229,6 +3303,9 @@ int main(void) {
     test_attn_mm(4, 128, false);
     test_attn_mm(8, 128, false);
     test_attn_mm(9, 128, false);
+#ifndef __APPLE__
+    test_attn_groups();
+#endif
     test_gdn(&arena, 2, 6, 32, 7);
     test_gdn(&arena, 2, 6, 64, 9);
     test_gdn(&arena, 2, 6, 96, 17);

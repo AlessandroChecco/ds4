@@ -222,6 +222,133 @@ __global__ void attn_merge(float *out, const float *partial, const float *gate,
     out[i] = (denom > 0 ? acc / denom : 0) * sigmoid(gate[i]);
 }
 
+/* The heads in a KV group share the same selected keys. Keep their output
+ * accumulators in registers and use tensor cores for both products. Scaled
+ * residual components retain the fine part of the FP32 queries/probabilities;
+ * K and V are already half, so neither requires further rounding. */
+__global__ void attention_group(float *out, const float *q, const float *gate,
+        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32;
+    const unsigned t = blockIdx.y, kh = blockIdx.x, group = H/Hkv;
+    const unsigned qr = tid/16, col = tid%16, h = kh*group+qr;
+    const unsigned n = sparse ? counts[t] : pos0+t+1;
+    __shared__ __align__(32) __half qh[16][264], ql[16][264], kv[32][264];
+    union Scores { float part[2][16][32]; __half prob[2][16][40]; };
+    __shared__ __align__(32) Scores scores;
+    __shared__ float qs[16], max_score[16], denom[16], correction[16];
+    __shared__ unsigned positions[32];
+    float mx = 0;
+    for (unsigned d = col; d < D; d += 16)
+        if (qr < group) mx = fmaxf(mx,fabsf(q[((uint64_t)t*H+h)*D+d]*scale));
+    for (unsigned off = 8; off; off /= 2) mx = fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,off,16));
+    const int exp = mx > 0 ? max(-120,min(120,(int)((__float_as_uint(mx)>>23)&255)-127)) : 0;
+    const float inv = ldexpf(1,-exp);
+    if (!col) { qs[qr] = ldexpf(1,exp); max_score[qr] = -3e38f; denom[qr] = 0; }
+    for (unsigned d = col; d < D; d += 16) {
+        const float v = qr < group ? q[((uint64_t)t*H+h)*D+d]*scale*inv : 0;
+        qh[qr][d] = __float2half_rn(v);
+        ql[qr][d] = __float2half_rn((v-__half2float(qh[qr][d]))*4096);
+    }
+    float result[4][4] = {};
+    __syncthreads();
+    for (unsigned j0 = 0; j0 < n; j0 += 32) {
+        if (tid < 32) {
+            const unsigned j = j0+tid;
+            const unsigned p = j < n ? (sparse ? (unsigned)sel[(uint64_t)t*stride+j] : j) : UINT_MAX;
+            positions[tid] = p <= pos0+t ? p : UINT_MAX;
+        }
+        __syncthreads();
+        for (unsigned i = tid*8; i < 32*D; i += 256*8) {
+            const unsigned r = i/D, d = i%D, p = positions[r];
+            tt_cp_async_16B(&kv[r][d],kc+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+d,p != UINT_MAX);
+        }
+        tt_cp_async_commit();
+        tt_cp_async_wait_group<0>();
+        __syncthreads();
+        float hi[4] = {}, lo[4] = {};
+        const unsigned split = warp/4, key0 = (warp%4)*8;
+        for (unsigned k = split*128; k < (split+1)*128; k += 16) {
+            uint32_t ah[4], al[4], b[2];
+            tt_ldmatrix_x4(ah,&qh[lane%16][k+(lane/16)*8]);
+            tt_ldmatrix_x4(al,&ql[lane%16][k+(lane/16)*8]);
+            tt_ldmatrix_x2(b,&kv[key0+lane%8][k+((lane%16)/8)*8]);
+            tt_mma_m16n8k16_f16_f32(hi,ah,b);
+            tt_mma_m16n8k16_f16_f32(lo,al,b);
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++)
+            scores.part[split][tt_mma_c_i(lane,i)][key0+tt_mma_c_j(lane,i)] = hi[i]+lo[i]*0x1p-12f;
+        __syncthreads();
+        float prob[2], peak = max_score[qr];
+        #pragma unroll
+        for (unsigned i = 0; i < 2; i++) {
+            const unsigned key = col+i*16;
+            prob[i] = positions[key] != UINT_MAX ?
+                (scores.part[0][qr][key]+scores.part[1][qr][key])*qs[qr] : -3e38f;
+            peak = fmaxf(peak,prob[i]);
+        }
+        for (unsigned off = 8; off; off /= 2) peak = fmaxf(peak,__shfl_xor_sync(0xffffffff,peak,off,16));
+        const float old = expf(max_score[qr]-peak);
+        float total = 0;
+        #pragma unroll
+        for (unsigned i = 0; i < 2; i++) {
+            prob[i] = positions[col+i*16] != UINT_MAX ? expf(prob[i]-peak) : 0;
+            total += prob[i];
+        }
+        for (unsigned off = 8; off; off /= 2) total += __shfl_xor_sync(0xffffffff,total,off,16);
+        __syncthreads();
+        if (!col) {
+            correction[qr] = old;
+            max_score[qr] = peak;
+            denom[qr] = denom[qr]*old+total;
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < 2; i++) {
+            const __half p = __float2half_rn(prob[i]);
+            scores.prob[0][qr][col+i*16] = p;
+            scores.prob[1][qr][col+i*16] = __float2half_rn((prob[i]-__half2float(p))*4096);
+        }
+        for (unsigned i = tid*8; i < 32*D; i += 256*8) {
+            const unsigned r = i/D, d = i%D, p = positions[r];
+            tt_cp_async_16B(&kv[r][d],vc+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+d,p != UINT_MAX);
+        }
+        tt_cp_async_commit();
+        tt_cp_async_wait_group<0>();
+        __syncthreads();
+        #pragma unroll
+        for (unsigned tile = 0; tile < 4; tile++) {
+            float hi[4] = {}, lo[4] = {};
+            #pragma unroll
+            for (unsigned k = 0; k < 32; k += 16) {
+                uint32_t ah[4], al[4], b[2];
+                tt_ldmatrix_x4(ah,&scores.prob[0][lane%16][k+(lane/16)*8]);
+                tt_ldmatrix_x4(al,&scores.prob[1][lane%16][k+(lane/16)*8]);
+                tt_ldmatrix_x2_trans(b,&kv[k+lane%16][warp*32+tile*8]);
+                tt_mma_m16n8k16_f16_f32(hi,ah,b);
+                tt_mma_m16n8k16_f16_f32(lo,al,b);
+            }
+            #pragma unroll
+            for (unsigned i = 0; i < 4; i++) result[tile][i] =
+                result[tile][i]*correction[tt_mma_c_i(lane,i)]+(hi[i]+lo[i]*0x1p-12f);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned tile = 0; tile < 4; tile++) {
+        #pragma unroll
+        for (unsigned i = 0; i < 4; i++) {
+            const unsigned r = tt_mma_c_i(lane,i), d = warp*32+tile*8+tt_mma_c_j(lane,i);
+            if (r < group) {
+                const uint64_t dst = ((uint64_t)t*H+kh*group+r)*D+d;
+                out[dst] = (denom[r] > 0 ? result[tile][i]/denom[r] : 0)*sigmoid(gate[dst]);
+            }
+        }
+    }
+#endif
+}
+
 static bool tensor(const ds4_gpu_tensor *t, uint64_t bytes) {
     return t && t->ptr && bytes <= t->bytes;
 }
@@ -2132,6 +2259,15 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
     const unsigned keys = sparse ? stride : pos0 + T;
+    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
+        !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
+        ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
+        attention_group<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
+            (const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
+            sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,
+            H,Hkv,pos0,stride,sparse,scale);
+        return launched();
+    }
     const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
     if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
     const dim3 grid((H + 3) / 4, T, splits);
