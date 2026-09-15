@@ -863,8 +863,8 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     free(order); free(got); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gs); free(sc);
 }
 
-/* prefill attention kernel vs the per-token kernel on the same inputs */
-static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H) {
+/* Prefill and split attention against scalar attention on the same inputs. */
+static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
     const uint32_t cap = pos0 + T;
     const uint64_t qn = (uint64_t)T * H * D, kvn = (uint64_t)cap * Hkv * D;
@@ -897,8 +897,8 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     for (uint32_t t = 0; t < T; t++) {
         const float amplitude = t % 3 == 0 ? 64 : t % 3 == 1 ? 0.00001f : 1;
         for (uint32_t i = 0; i < H * D; i++) q[(uint64_t)t * H * D + i] *= amplitude;
-        if (sparse && t % 7 == 0) cnt[t] = 0;
-        else if (sparse && t % 11 == 1) {
+        if (sparse && T > 2 && t % 7 == 0) cnt[t] = 0;
+        else if (sparse && T > 2 && t % 11 == 1) {
             cnt[t] = 1;
             sel[(uint64_t)t * sel_stride] = -1;
         } else if (sparse && cnt[t] && t + 1 < T)
@@ -909,12 +909,14 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
     ds4_gpu_tensor *go_ref = upload(NULL, qn), *go_new = upload(NULL, qn);
+    ds4_gpu_tensor *partial = split ? ds4_gpu_tensor_alloc((uint64_t)T*H*64*(D+2)*4) : NULL;
+    require_ok(!split || partial, "attention partial allocation");
     require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
                ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn mm setup");
     setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
@@ -924,7 +926,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
         if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
     }
     char name[96];
-    snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s", T, H, pos0, sparse ? "sparse" : "dense");
+    snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s%s", T, H, pos0, sparse ? "sparse" : "dense", split ? " split" : "");
 #ifdef __APPLE__
     require_ok(worst <= 4e-3 * scale, name);
 #else
@@ -967,24 +969,31 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     require_ok(cpu_error <= 3e-5 * fmax(cpu_scale,1e-8), "attention double reference");
     printf("  %-44s CPU max|d|=%.2e scalar=%.2e (scale %.2e)\n", name, cpu_error, scalar_error, cpu_scale);
 #endif
-    if (T <= 8u) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
+    if (T <= 8u && !split) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
     printf("  %-44s ok  max|d|=%.2e (scale %.2e)\n", name, worst, scale);
     free(ref); free(got); free(q); free(gate); free(kc); free(vc); free(sel); free(cnt);
     ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
+    ds4_gpu_tensor_free(partial);
 }
 
 static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
-    test_attn_mm_keys(T, pos0, sparse, 6, 24);
+    test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
 }
 
 #ifndef __APPLE__
 static void test_attn_groups(void) {
-    test_attn_mm_keys(32, 4093, false, 6, 24);
-    test_attn_mm_keys(33, 8193, true, 511, 24);
-    test_attn_mm_keys(32, 97, false, 6, 2);
-    test_attn_mm_keys(33, 100, true, 6, 32);
-    test_attn_mm_keys(33, 100, true, 6, 34);
+    test_attn_mm_keys(32, 4093, false, 6, 24, false);
+    test_attn_mm_keys(33, 8193, true, 511, 24, false);
+    test_attn_mm_keys(32, 97, false, 6, 2, false);
+    test_attn_mm_keys(33, 100, true, 6, 32, false);
+    test_attn_mm_keys(33, 100, true, 6, 34, false);
+    test_attn_mm_keys(1, 510, false, 6, 24, true);
+    test_attn_mm_keys(1, 511, false, 6, 24, true);
+    test_attn_mm_keys(1, 2052, false, 6, 24, true);
+    test_attn_mm_keys(2, 8193, true, 511, 24, true);
+    test_attn_mm_keys(8, 8193, true, 511, 32, true);
+    test_attn_mm_keys(2, 32769, false, 6, 24, true);
 }
 #endif
 
