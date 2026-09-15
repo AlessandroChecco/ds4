@@ -1883,6 +1883,23 @@ static void test_hc_norm_reuse_case(arena_t *a, uint32_t type, uint32_t E,
         require_ok(mode == 2u ? unsetenv("DS4_QWEN4_HC_NORM_REUSE") == 0
                              : setenv("DS4_QWEN4_HC_NORM_REUSE", mode ? "1" : "0", 1) == 0,
                    "select forced or automatic HC norm");
+#ifndef __APPLE__
+        /* CUDA uses its original one-token kernel as an independent dispatch
+         * control, not the Metal-only environment switch above. */
+        if (mode == 0u && T > 8u) {
+            for (uint32_t t = 0; t < T; t++) {
+                ds4_gpu_tensor *r = ds4_gpu_tensor_view(gR,t*dim*4,dim*4);
+                ds4_gpu_tensor *x = ds4_gpu_tensor_view(gxn[mode],t*dim*4,dim*4);
+                const uint64_t partials = (uint64_t)hc*CH*n_inject;
+                ds4_gpu_tensor *in = n_inject ? ds4_gpu_tensor_view(ginj[mode],t*partials*4,partials*4) : NULL;
+                require_ok(r && x && (!n_inject || in),"HC norm decode control views");
+                require_ok(ds4_gpu_qwen4_hc_norm_tensor(x,in,r,a->base,a->size,
+                    gamma_off,inject_off,type,1,E,hc,n_inject,eps),"HC norm decode control");
+                ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(r);
+            }
+            continue;
+        }
+#endif
         require_ok(ds4_gpu_qwen4_hc_norm_tensor(gxn[mode], ginj[mode], gR, a->base, a->size,
                    gamma_off, inject_off, type, T, E, hc, n_inject, eps), "HC norm dispatch");
     }
@@ -1934,6 +1951,10 @@ static void test_hc_norm_reuse(arena_t *a) {
         {2560u, 4u, 3u, 4u},
         {2560u, 4u, 9u, 0u},
         {2560u, 4u, 17u, 4u},
+        {2560u, 4u, 8u, 4u},
+        {2560u, 4u, 9u, 4u},
+        {260u, 8u, 9u, 3u},
+        {4u, 8u, 9u, 4u},
         {260u, 8u, 3u, 3u},   /* final chunk is shorter, stream boundary splits Q8 blocks */
         {40u, 4u, 5u, 1u},
         {260u, 8u, 3u, 2u},

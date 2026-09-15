@@ -1337,6 +1337,43 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     }
 }
 
+/* Prefill has enough tokens to share one normalization across all eight
+ * injection chunks. Each warp preserves the four partial sums of the
+ * decode kernel, including their order, without rereading R eight times. */
+template<unsigned TYPE>
+__global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
+        const float *gamma, const char *wi, unsigned E, unsigned hc,
+        unsigned ni, float eps) {
+    const unsigned stream = blockIdx.x, tok = blockIdx.y;
+    const unsigned tid = threadIdx.x, lane = tid & 31, chunk = tid / 32;
+    const unsigned dim = E * hc, per = (E + 7) / 8;
+    const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    __shared__ float red[32];
+    float ss = 0;
+    if (tid < 128) for (unsigned i = tid; i < E; i += 128)
+        ss += R[base+i] * R[base+i];
+    const float inv = rsqrtf(block_sum(ss,red) / E + eps);
+    float acc[4][4] = {};
+    const unsigned end = min(E,(chunk+1)*per);
+    #pragma unroll
+    for (unsigned part = 0; part < 4; part++) {
+        for (unsigned i = chunk*per+lane+part*32; i < end; i += 128) {
+            const float v = R[base+i] * inv * gamma[stream*E+i];
+            xn[base+i] = v;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; j++) if (j < ni)
+                acc[j][part] += value<TYPE>(wi,j*dim+stream*E+i) * v;
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < 4; j++) if (j < ni) {
+        float v = 0;
+        #pragma unroll
+        for (unsigned part = 0; part < 4; part++) v += sum(acc[j][part]);
+        if (!lane) inj[((uint64_t)tok*hc*8+stream*8+chunk)*ni+j] = v;
+    }
+}
+
 template<unsigned TYPE>
 __global__ void hc_mix(float *out, const float *xn, const float *lo,
                        const char *up, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
@@ -1649,6 +1686,15 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
     const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
     if (!gamma || !wi || (type != 0 && type != 1 && type != 8)) return 0;
+    if (T > 8) {
+#define QWEN_HC_NORM(TYPE) hc_norm_prefill<TYPE><<<dim3(hc,T),256,0,cuda_decode_stream()>>>((float *)xn->ptr, \
+        ni ? (float *)inj->ptr : NULL,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
+        if (type == 0) { QWEN_HC_NORM(0); }
+        else if (type == 1) { QWEN_HC_NORM(1); }
+        else { QWEN_HC_NORM(8); }
+#undef QWEN_HC_NORM
+        return launched();
+    }
     hc_norm<<<dim3(hc * 8, T), 128, 0, cuda_decode_stream()>>>((float *)xn->ptr,
         ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
     return launched();
