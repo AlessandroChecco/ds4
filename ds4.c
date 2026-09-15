@@ -78253,7 +78253,12 @@ static void qwen4_batch_row_graph(ds4_qwen4_gpu_graph *out, ds4_session *s,
     out->attn_o = v->attn_o;
 }
 
+/* The Q8 tile computes 32 rows and needs the padding rows to exist in both
+ * operands, so the logits and head rows are sized for at least that many:
+ * the output head then takes the tile at any batch width instead of the
+ * per-token matvec reading its 636 MB once per four rows. */
 static bool qwen4_batch_scratch_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
+    if (rows < 32u) rows = 32u;
     if (g->batch_logits && g->batch_logit_rows >= rows) return true;
     ds4_gpu_tensor_free(g->batch_logits);
     ds4_gpu_tensor_free(g->batch_attn_rows);
