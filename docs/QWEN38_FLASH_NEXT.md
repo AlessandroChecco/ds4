@@ -59,15 +59,15 @@ Measured on a single Spark with resident weights and disk-only n-grams:
 
 | Model | First 1024 tokens | Next 7168 tokens | Decode at 8192 tokens |
 | --- | ---: | ---: | ---: |
-| Q2 | 460 t/s | 598 t/s | 21.0 t/s |
-| Q4 | 486 t/s | 588 t/s | 21.4 t/s |
+| Q2 | 488 t/s | 687 t/s | 21.0 t/s |
+| Q4 | 499 t/s | 675 t/s | 21.4 t/s |
 
 These are averages of two runs using `speed-bench/promessi_sposi.txt`,
 8192-token prefill chunks and 128 teacher-forced decode tokens, without MTP.
-Loading the model is excluded. Compared with the initial CUDA port, continued
-prefill is about 2.4 times faster and decode is 18% faster for Q2, 23% for Q4.
-On two short prose prompts, `--mtp` reached 26.5-31.0 t/s for Q2 and
-24.8-28.9 t/s for Q4. Its benefit depends on how often drafts are accepted.
+Loading the model is excluded. Q2 also reached about 700 t/s on a fresh
+32K-token prefix. Small continuations have lower throughput: adding 32 tokens
+after an 8K Q4 prefix took about 282 ms. MTP speed depends on how often drafts
+are accepted; the table measures ordinary decoding.
 
 ## Conversion
 
