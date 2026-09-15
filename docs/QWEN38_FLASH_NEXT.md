@@ -162,6 +162,22 @@ Vision and end-to-end checks additionally require the checkpoints above.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` on either backend to check
 failed disk reads during prefill, decode and MTP, then exact recovery.
 
+Official Alibaba continuations are tracked for 100 short prompts and 12
+archive/code prompts from 2K to 24K tokens. Build the quality scorer, then run
+from the repository root:
+
+```sh
+gguf-tools/quality-testing/score_official MODEL.gguf \
+  gguf-tools/quality-testing/data/qwen38-flash-alibaba-100/manifest.tsv /tmp/qwen-short.tsv 4096
+gguf-tools/quality-testing/score_official MODEL.gguf \
+  gguf-tools/quality-testing/data/qwen38-flash-alibaba-long/manifest.tsv /tmp/qwen-long.tsv 32768
+```
+
+Repeat with `--quality` and, for the long set, `--continued-prefill 1` and
+`--continued-prefill 256`. These fixtures match the no-thinking template;
+no rendered-prompt flag is needed. See [quality testing](../gguf-tools/quality-testing/README.md)
+for collection settings, measurements and the hosted-checkpoint limitations.
+
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.
 
