@@ -1952,6 +1952,9 @@ paired comparisons, also with decode graphs disabled. Separately run the
   synccheck. This covers grouped prefill and split decode attention against
   independent double-precision references, including empty/masked selections,
   large/small queries, head-group tails and long dense/sparse contexts.
+  Repeat those sanitizer tools with `DS4_TEST_QWEN4_DENSE_ONLY=1` and
+  `DS4_TEST_QWEN4_EXPERT_TILES=1`. Check residual-corrected dense projections,
+  odd strides, large outputs, partial expert tiles and untouched output guards.
 - Build `tests/test_qwen4_prefill` and run it with a real prompt through at
   least 8K context on both Metal and CUDA. Same-schedule replay must agree;
   record different-schedule probability differences separately. Nearly tied
@@ -2002,13 +2005,15 @@ means; use the section 16 procedure for release medians:
 
 | Model | Initial 1024 prefill | Next 7168 prefill | Decode at 8192 |
 | --- | ---: | ---: | ---: |
-| Q2 | 488 t/s | 687 t/s | 21.0 t/s |
-| Q4 | 499 t/s | 675 t/s | 21.4 t/s |
+| Q2 | 516 t/s | 745 t/s | 22.6 t/s |
+| Q4 | 513 t/s | 755 t/s | 21.2 t/s |
 
 Also measure short continuations: eight 32-token Q4 appends after an 8K prefix
-have a reference mean latency of about 282 ms each. Include following decode
+have a reference mean latency of about 273 ms each. Include following decode
 so work is not merely deferred. Check ordinary and MTP generation on code
 and prose, retaining text and acceptance statistics as required by section 16.
+Repeat a fresh 32K Q2 prefix with `--prefill-chunk 32768`; its reference
+prefill rate is about 771 t/s.
 
 M5 Max Metal indicative single-run references, disk-only n-grams:
 

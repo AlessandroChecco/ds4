@@ -506,11 +506,14 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         const uint64_t grid = grid_table[(ids>>(8*sub))&255];
         const unsigned signs = sign_table[(ss>>(7*sub))&127];
         const float scale = dev_f16_to_f32(b->d)*(.5f+(ss>>28))*.25f;
+        /* Apply four signs before conversion. IQ2's nonzero magnitudes keep
+         * the packed negations from carrying into neighboring bytes. */
+        const unsigned offset = j&7;
+        const unsigned bits = (((signs>>offset)&15)*0x00204081u)&0x01010101u;
+        const unsigned packed = (((unsigned)(grid>>(8*offset)))^(bits*255u))+bits;
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) {
-            const unsigned bit = (j+k)&7;
-            const float q = (float)((grid>>(8*bit))&255);
-            v[k] = scale*(signs&(1u<<bit) ? -q : q);
+            v[k] = scale*(float)(int8_t)(packed>>(8*k));
         }
     } else if (TYPE == 10 || TYPE == 12) {
         const unsigned j = i%256;
@@ -932,28 +935,30 @@ __global__ void matrix_reg(float *out, const float *x, const char *w0, const cha
 
 /* Match the half operands of the production Metal expert tiles. Products
  * accumulate in FP32; only the matrix operands are rounded to half. */
-template<unsigned TYPE, bool DOWN, unsigned NT>
+template<unsigned TYPE, bool DOWN, unsigned NT, unsigned NR = 64>
 __global__ void matrix_half_tile(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
 #if __CUDA_ARCH__ >= 800
     namespace wm = nvcuda::wmma;
-    const unsigned tid = threadIdx.x, warp = tid/32, nr = (M+63)/64, job = blockIdx.x/nr;
+    const unsigned tid = threadIdx.x, warp = tid/32, nr = (M+NR-1)/NR, job = blockIdx.x/nr;
     if (job >= tiles[NE]) return;
     unsigned e = 0, end = NE;
     while (e < end) {
         const unsigned mid = (e+end)/2;
         if (tiles[mid+1] <= job) e = mid+1; else end = mid;
     }
-    const unsigned count = counts[e], t0 = (job-tiles[e])*NT, r0 = (blockIdx.x%nr)*64;
+    const unsigned count = counts[e], t0 = (job-tiles[e])*NT, r0 = (blockIdx.x%nr)*NR;
+    const unsigned wr = warp%(NR/16), wc = warp/(NR/16);
+    constexpr unsigned NC = NT/(8/(NR/16));
     union Tile {
-        __half ab[(64+(DOWN ? 0 : 64)+NT)*72];
-        float c[64][NT];
+        __half ab[(NR+(DOWN ? 0 : NR)+NT)*72];
+        float c[NR][NT];
     };
     __shared__ __align__(32) Tile tile;
     __half (*a)[72] = (__half (*)[72])tile.ab;
-    __half (*u)[72] = a+64;
-    __half (*b)[72] = a+64+(DOWN ? 0 : 64);
+    __half (*u)[72] = a+NR;
+    __half (*b)[72] = a+NR+(DOWN ? 0 : NR);
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
     if (TYPE == 16) {
@@ -961,14 +966,14 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
         for (unsigned i = tid; i < 128; i += 256) sign_table[i] = cuda_ksigns_iq2xs[i];
         __syncthreads();
     }
-    wm::fragment<wm::accumulator,16,16,16,float> acc[NT/32], up[NT/32];
+    wm::fragment<wm::accumulator,16,16,16,float> acc[NC/16], up[NC/16];
     #pragma unroll
-    for (unsigned j = 0; j < NT/32; j++) {
+    for (unsigned j = 0; j < NC/16; j++) {
         wm::fill_fragment(acc[j],0);
         if (!DOWN) wm::fill_fragment(up[j],0);
     }
     for (unsigned k0 = 0; k0 < K; k0 += 64) {
-        for (unsigned i = tid*4; i < 64*64; i += 256*4) {
+        for (unsigned i = tid*4; i < NR*64; i += 256*4) {
             const unsigned row = r0+i/64, k = k0+i%64;
             const uint64_t off = ((uint64_t)e*M+row)*rb;
             const float4 av = row < M && k < K ? value4<TYPE>(w0+off,k,grid_table,sign_table) : make_float4(0,0,0,0);
@@ -990,12 +995,12 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
         #pragma unroll
         for (unsigned k = 0; k < 64; k += 16) {
             wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> af, uf;
-            wm::load_matrix_sync(af,&a[(warp%4)*16][k],72);
-            if (!DOWN) wm::load_matrix_sync(uf,&u[(warp%4)*16][k],72);
+            wm::load_matrix_sync(af,&a[wr*16][k],72);
+            if (!DOWN) wm::load_matrix_sync(uf,&u[wr*16][k],72);
             #pragma unroll
-            for (unsigned j = 0; j < NT/32; j++) {
+            for (unsigned j = 0; j < NC/16; j++) {
                 wm::fragment<wm::matrix_b,16,16,16,__half,wm::col_major> bf;
-                wm::load_matrix_sync(bf,&b[(warp/4)*(NT/2)+j*16][k],72);
+                wm::load_matrix_sync(bf,&b[wc*NC+j*16][k],72);
                 wm::mma_sync(acc[j],af,bf,acc[j]);
                 if (!DOWN) wm::mma_sync(up[j],uf,bf,up[j]);
             }
@@ -1003,13 +1008,13 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
         __syncthreads();
     }
     #pragma unroll
-    for (unsigned j = 0; j < NT/32; j++) {
+    for (unsigned j = 0; j < NC/16; j++) {
         if (!DOWN) for (unsigned i = 0; i < acc[j].num_elements; i++)
             acc[j].x[i] = silu(acc[j].x[i])*up[j].x[i];
-        wm::store_matrix_sync(&tile.c[(warp%4)*16][(warp/4)*(NT/2)+j*16],acc[j],NT,wm::mem_row_major);
+        wm::store_matrix_sync(&tile.c[wr*16][wc*NC+j*16],acc[j],NT,wm::mem_row_major);
     }
     __syncthreads();
-    for (unsigned i = tid; i < 64*NT; i += 256) {
+    for (unsigned i = tid; i < NR*NT; i += 256) {
         const unsigned row = r0+i/NT, item = t0+i%NT;
         if (row < M && item < count) {
             const unsigned pair = lists[(uint64_t)e*cap+item];
@@ -1031,10 +1036,12 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
             if (!tiles) return 0;
             expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles,counts,NE,nt);
             if (!launched()) return 0;
-            const uint64_t blocks = (((uint64_t)T*NS+nt-1)/nt+NE)*((M+63)/64);
+            /* Wider rows reuse activations; Q2_K down is faster at 64 rows. */
+            const unsigned nr = nt == 64 && type != 10 ? 128 : 64;
+            const uint64_t blocks = (((uint64_t)T*NS+nt-1)/nt+NE)*((M+nr-1)/nr);
             if (blocks > INT_MAX) return 0;
 #define QWEN_HALF(TYPE, DOWN) \
-            if (nt == 64) matrix_half_tile<TYPE,DOWN,64><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+            if (nt == 64) matrix_half_tile<TYPE,DOWN,64,(TYPE == 10 ? 64 : 128)><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
             else matrix_half_tile<TYPE,DOWN,32><<<blocks,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb)
 #define QWEN_HALF_TYPE(TYPE) case TYPE: if (down) { QWEN_HALF(TYPE,true); } else { QWEN_HALF(TYPE,false); } break
             switch (type) { QWEN_HALF_TYPE(16); QWEN_HALF_TYPE(10); QWEN_HALF_TYPE(12); QWEN_HALF_TYPE(39); }
@@ -1224,54 +1231,105 @@ __global__ void pack_half_components(float *scales, __half *hi, __half *lo,
     }
 }
 
-__global__ void dense_rescale(float *out, const float *src, const float *scales,
-        unsigned M, unsigned N, unsigned stride) {
+__global__ void dense_rescale(float *out, const float *scales,
+        unsigned M, unsigned N) {
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    if (i < (uint64_t)M*N) out[(i/M)*stride+i%M] = src[i]*scales[i/M];
+    if (i < (uint64_t)M*N) out[i] *= scales[i/M];
+}
+
+/* Short projections reuse the weights for both activation components.
+ * Keep separate FP32 sums and the same scaled residual as the cuBLAS path. */
+__global__ void dense_f16_components(float *out, const __half *xh, const __half *xl,
+        const __half *w, const float *scales, unsigned T, unsigned K, unsigned M) {
+#if __CUDA_ARCH__ >= 800
+    namespace wm = nvcuda::wmma;
+    const unsigned tid = threadIdx.x, warp = tid/32;
+    const unsigned m0 = blockIdx.x*64, t0 = blockIdx.y*64;
+    union Tile { __half data[3][64][72]; float result[64][64]; };
+    __shared__ __align__(32) Tile tile;
+    wm::fragment<wm::accumulator,16,16,16,float> hi[2], lo[2];
+    for (unsigned j = 0; j < 2; j++) {
+        wm::fill_fragment(hi[j],0);
+        wm::fill_fragment(lo[j],0);
+    }
+    for (unsigned k0 = 0; k0 < K; k0 += 64) {
+        for (unsigned i = tid*8; i < 4096; i += 2048) {
+            const unsigned r = i/64, k = i%64;
+            const bool valid_w = m0+r < M, valid_x = t0+r < T;
+            tt_cp_async_16B(&tile.data[0][r][k],w+((uint64_t)(valid_w ? m0+r : 0))*K+k0+k,valid_w);
+            tt_cp_async_16B(&tile.data[1][r][k],xh+((uint64_t)(valid_x ? t0+r : 0))*K+k0+k,valid_x);
+            tt_cp_async_16B(&tile.data[2][r][k],xl+((uint64_t)(valid_x ? t0+r : 0))*K+k0+k,valid_x);
+        }
+        tt_cp_async_commit();
+        tt_cp_async_wait_group<0>();
+        __syncthreads();
+        for (unsigned k = 0; k < 64; k += 16) {
+            wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> a;
+            wm::load_matrix_sync(a,&tile.data[0][(warp%4)*16][k],72);
+            for (unsigned j = 0; j < 2; j++) {
+                wm::fragment<wm::matrix_b,16,16,16,__half,wm::col_major> b, c;
+                wm::load_matrix_sync(b,&tile.data[1][(warp/4)*32+j*16][k],72);
+                wm::load_matrix_sync(c,&tile.data[2][(warp/4)*32+j*16][k],72);
+                wm::mma_sync(hi[j],a,b,hi[j]);
+                wm::mma_sync(lo[j],a,c,lo[j]);
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned j = 0; j < 2; j++) {
+        for (unsigned i = 0; i < hi[j].num_elements; i++) hi[j].x[i] += lo[j].x[i]*0x1p-12f;
+        wm::store_matrix_sync(&tile.result[(warp%4)*16][(warp/4)*32+j*16],hi[j],64,wm::mem_row_major);
+    }
+    __syncthreads();
+    for (unsigned i = tid; i < 4096; i += 256) {
+        const unsigned m = m0+i%64, t = t0+i/64;
+        if (m < M && t < T) out[(uint64_t)t*M+m] = tile.result[i%64][i/64]*scales[t];
+    }
+#endif
 }
 
 static int dense_f16_blas(float *out, const float *x, const __half *w,
         unsigned T, unsigned K, unsigned M) {
-    const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(64)<<20)/((uint64_t)T*4));
-    const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
-    const uint64_t xn = (uint64_t)T*K, yn = (uint64_t)tile*T;
-    __half *hi = (__half *)cuda_tmp_alloc((xn+yn+T)*4, "Qwen F16 projection scratch");
+    const uint64_t xn = (uint64_t)T*K;
+    __half *hi = (__half *)cuda_tmp_alloc((xn+T)*4, "Qwen F16 projection scratch");
     if (!hi) return 0;
     __half *lo = hi+xn;
-    float *y = (float *)(lo+xn), *scales = y+yn;
+    float *scales = (float *)(lo+xn);
     pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(scales,hi,lo,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
-    const float zero = 0, one = 1, low = 0x1p-12f;
-    for (unsigned r = 0; r < M; r += tile) {
-        const unsigned n = std::min(tile,M-r);
-        if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,w+(uint64_t)r*K,CUDA_R_16F,K,lo,CUDA_R_16F,K,&zero,y,CUDA_R_32F,n,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 residual projection") ||
-            !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&one,w+(uint64_t)r*K,CUDA_R_16F,K,hi,CUDA_R_16F,K,&one,y,CUDA_R_32F,n,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 leading projection")) return 0;
-        dense_rescale<<<((uint64_t)n*T+255)/256,256,0,cuda_decode_stream()>>>(out+r,y,scales,n,T,M);
-        if (!launched()) return 0;
+    if (K <= 512 && K%64 == 0 && T >= 32 && ds4_cuda_attn_tokentile_arch_ok()) {
+        dense_f16_components<<<dim3((M+63)/64,(T+63)/64),256,0,cuda_decode_stream()>>>(out,hi,lo,w,scales,T,K,M);
+        return launched();
     }
-    return 1;
+    const float zero = 0, one = 1, low = 0x1p-12f;
+    if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                M,T,K,&low,w,CUDA_R_16F,K,lo,CUDA_R_16F,K,&zero,out,CUDA_R_32F,M,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 residual projection") ||
+        !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
+                M,T,K,&one,w,CUDA_R_16F,K,hi,CUDA_R_16F,K,&one,out,CUDA_R_32F,M,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT), "Qwen F16 leading projection")) return 0;
+    dense_rescale<<<((uint64_t)M*T+255)/256,256,0,cuda_decode_stream()>>>(out,scales,M,T);
+    return launched();
 }
 
-__global__ void dense_rescale2(float *out, const float *src, const float *xs, const float *ws,
+__global__ void dense_rescale2(float *out, const float *xs, const float *ws,
         unsigned M, unsigned T, unsigned stride) {
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    if (i < (uint64_t)M*T) out[(i/M)*stride+i%M] = src[i]*xs[i/M]*ws[i%M];
+    if (i < (uint64_t)M*T) {
+        const uint64_t dst = (i/M)*stride+i%M;
+        out[dst] = out[dst]*xs[i/M]*ws[i%M];
+    }
 }
 
 static int dense_q8_blas(float *out, const float *x, const char *w,
         unsigned T, unsigned K, unsigned M) {
-    const unsigned bound = (unsigned)std::max(UINT64_C(1),
-        std::min((UINT64_C(32)<<20)/((uint64_t)K*4),(UINT64_C(64)<<20)/((uint64_t)T*4)));
+    const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(32)<<20)/((uint64_t)K*4));
     const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
-    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)tile*K, yn = (uint64_t)tile*T;
-    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+yn+T+tile)*4,"Qwen Q8 projection scratch");
+    const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)tile*K;
+    __half *xh = (__half *)cuda_tmp_alloc((xn+wn+T+tile)*4,"Qwen Q8 projection scratch");
     if (!xh) return 0;
     __half *xl = xh+xn, *wh = xl+xn, *wl = wh+wn;
-    float *y = (float *)(wl+wn), *xs = y+yn, *ws = xs+T;
+    float *xs = (float *)(wl+wn), *ws = xs+T;
     pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(xs,xh,xl,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
     const float zero = 0, one = 1, low = 0x1p-12f;
@@ -1281,15 +1339,15 @@ static int dense_q8_blas(float *out, const float *x, const char *w,
         pack_half_components<8><<<n,256,0,cuda_decode_stream()>>>(ws,wh,wl,w+(uint64_t)r*rb,K,rb);
         if (!launched()) return 0;
         if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,y,CUDA_R_32F,n,
+                n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out+r,CUDA_R_32F,M,
                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 weight residual") ||
             !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wh,CUDA_R_16F,K,xl,CUDA_R_16F,K,&one,y,CUDA_R_32F,n,
+                n,T,K,&low,wh,CUDA_R_16F,K,xl,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 input residual") ||
             !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,y,CUDA_R_32F,n,
+                n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
                 CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 leading product")) return 0;
-        dense_rescale2<<<((uint64_t)n*T+255)/256,256,0,cuda_decode_stream()>>>(out+r,y,xs,ws,n,T,M);
+        dense_rescale2<<<((uint64_t)n*T+255)/256,256,0,cuda_decode_stream()>>>(out+r,xs,ws,n,T,M);
         if (!launched()) return 0;
     }
     return 1;

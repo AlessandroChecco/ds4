@@ -3135,9 +3135,9 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
 #ifndef __APPLE__
 /* Check half-operand expert tiles independently at every CUDA tile width.
  * The existing tests above still bound their error versus unrounded weights. */
-static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype) {
-    const uint32_t E = 256, F = 64, NE = 4, NS = 2, NO = 3, cap = T+7, guard = 16;
-    const uint32_t DF = dtype == 10 ? 256 : F;
+static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype, uint32_t F) {
+    const uint32_t E = 256, NE = 4, NS = 2, NO = 3, cap = T+7, guard = 16;
+    const uint32_t DF = dtype == 10 ? (F+255u)/256u*256u : F;
     double *gw, *uw, *dw;
     uint64_t go = arena_tier(a,type,(uint64_t)NE*F,E,&gw);
     uint64_t uo = arena_tier(a,type,(uint64_t)NE*F,E,&uw);
@@ -3198,7 +3198,7 @@ static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32
         }
     }
     char name[96];
-    snprintf(name,sizeof(name),"half expert reference type=%u/%u T=%u",type,dtype,T);
+    snprintf(name,sizeof(name),"half expert reference type=%u/%u T=%u F=%u",type,dtype,T,F);
     check_close(name,got,ref,n,3e-5);
     free(mid); free(part); free(sel); free(x); free(gw); free(uw); free(dw);
     ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gl);
@@ -3230,6 +3230,47 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
+#ifndef __APPLE__
+/* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
+ * 17 independent input rows so the full CPU oracle stays inexpensive. */
+static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
+    const uint32_t K = 64, M = 2051, T = 8201, patterns = 17, guard = 64;
+    const uint64_t count = (uint64_t)T*M;
+    double *weights;
+    const uint64_t off = wtype == 8
+        ? arena_q8_0(a, M, K, &weights, 0.05f)
+        : arena_f16(a, (uint64_t)M*K, &weights, 0.05f);
+    float *rows = rand_vec((uint64_t)patterns*K, 1.0f);
+    float *x = malloc((uint64_t)T*K*sizeof(*x));
+    double *dots = calloc((uint64_t)patterns*M, sizeof(*dots));
+    double *ref = malloc((count+guard)*sizeof(*ref));
+    require_ok(x && dots && ref && rows, "large dense allocations");
+    for (uint32_t p = 0; p < patterns; p++)
+        for (uint32_t m = 0; m < M; m++)
+            for (uint32_t k = 0; k < K; k++)
+                dots[(uint64_t)p*M+m] += weights[(uint64_t)m*K+k]*rows[p*K+k];
+    for (uint32_t t = 0; t < T; t++) {
+        memcpy(x+(uint64_t)t*K, rows+(t%patterns)*K, K*sizeof(*x));
+        memcpy(ref+(uint64_t)t*M, dots+(t%patterns)*M, M*sizeof(*ref));
+    }
+    for (uint32_t i = 0; i < guard; i++) ref[count+i] = 17.25;
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T*K);
+    ds4_gpu_tensor *out = upload(NULL, count+guard);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        require_ok(ds4_gpu_tensor_fill_f32(out, 17.25f, count+guard), "large dense guard fill");
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size,
+            off, wtype, T, K, M), "large dense projection");
+        check_tensor(wtype == 8 ? "large Q8 dense output" : "large F16 dense output",
+                     out, ref, count, 3e-5);
+        float got_guard[64];
+        require_ok(ds4_gpu_tensor_read(out, count*4u, got_guard, sizeof(got_guard)), "large dense guard read");
+        for (unsigned i = 0; i < guard; i++) require_ok(got_guard[i] == 17.25f, "large dense output guard");
+    }
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx);
+    free(ref); free(dots); free(x); free(rows); free(weights);
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3242,6 +3283,22 @@ int main(void) {
 
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
+    if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
+        test_dense_mm_large(&arena, 1u);
+        test_dense_mm_large(&arena, 8u);
+        test_dense_mm(&arena, 10240, 1700, 32, 8u);
+        test_dense_mm(&arena, 320, 10240, 40, 1u);
+        test_dense_mm(&arena, 67, 97, 35, 1u);
+        test_dense_mm(&arena, 96, 129, 35, 8u);
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN4_EXPERT_TILES")) {
+        test_half_expert_tiles(&arena,33,16,10,64);
+        test_half_expert_tiles(&arena,33,12,39,64);
+        test_half_expert_tiles(&arena,2049,16,10,192);
+        test_half_expert_tiles(&arena,2049,12,39,192);
+        return 0;
+    }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
@@ -3355,14 +3412,20 @@ int main(void) {
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
 #ifndef __APPLE__
-    test_half_expert_tiles(&arena,33,16,10);
-    test_half_expert_tiles(&arena,2049,16,10);
-    test_half_expert_tiles(&arena,8193,16,10);
-    test_half_expert_tiles(&arena,33,12,39);
-    test_half_expert_tiles(&arena,2049,12,39);
-    test_half_expert_tiles(&arena,8193,12,39);
+    test_half_expert_tiles(&arena,33,16,10,64);
+    test_half_expert_tiles(&arena,2049,16,10,64);
+    test_half_expert_tiles(&arena,8193,16,10,64);
+    test_half_expert_tiles(&arena,33,12,39,64);
+    test_half_expert_tiles(&arena,2049,12,39,64);
+    test_half_expert_tiles(&arena,8193,12,39,64);
+    test_half_expert_tiles(&arena,2049,16,10,192);
+    test_half_expert_tiles(&arena,2049,12,39,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
+    test_dense_mm_large(&arena, 1u);
+    test_dense_mm_large(&arena, 8u);
+    test_dense_mm(&arena, 67, 97, 35, 1u);
+    test_dense_mm(&arena, 96, 129, 35, 8u);
     test_dense_mm(&arena, 32, 7, 1, 8u);
     test_dense_mm(&arena, 96, 9, 1, 8u);
     test_dense_mm(&arena, 68, 9, 1, 1u);
