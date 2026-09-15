@@ -57386,7 +57386,7 @@ static void *qwen4_ngram_thread(void *context) {
 #endif
 
 /* Bound sorting memory and I/O concurrency independently of context size.
- * Small decode requests avoid scheduling workers; all reads precede GPU use. */
+ * Metal also overlaps the uncached rows of a single decode token. */
 static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t count, float *out) {
     if (!m || !m->ngram_tensor || m->ngram_fd < 0 || (count && (!rows || !out)) ||
         count > SIZE_MAX / (160u * sizeof(float))) {
@@ -57396,11 +57396,15 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
     for (size_t i = 0; i < count; i++) {
         if (rows[i] >= m->ngram_tensor->dim[1]) { errno = EINVAL; return false; }
     }
+#ifdef __APPLE__
+    if (count < 2) return count == 0 || qwen4_ngram_row(m, rows[0], out);
+#else
     if (count < 256) {
         for (size_t i = 0; i < count; i++)
             if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_tensor->dim[0])) return false;
         return true;
     }
+#endif
     enum { MAX_ROWS = 4096 };
     qwen4_ngram_request *request = malloc(MAX_ROWS * sizeof(*request));
     if (!request) return false;
@@ -57412,6 +57416,7 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
         qwen4_ngram_batch batch = {.model = m, .request = request, .count = n,
             .out = out + off * m->ngram_tensor->dim[0], .readers = 16};
 #ifdef __APPLE__
+        batch.readers = n < 16 ? n : 16;
         dispatch_apply_f(batch.readers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                          &batch, qwen4_ngram_part);
 #else
