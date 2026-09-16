@@ -85,7 +85,10 @@ use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.
-Session-batched serving uses ordinary target decoding, not MTP/DSpark.
+Session-batched serving uses ordinary target decoding, except Qwen3.8 on
+Metal, where `--mtp` also batches speculative decoding. Its
+`--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
+requests. Other models do not use MTP/DSpark while session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
 ## Images
