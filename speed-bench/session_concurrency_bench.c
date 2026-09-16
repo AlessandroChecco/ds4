@@ -1055,9 +1055,16 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    const int64_t decode_budget = (int64_t)cfg.warmup + cfg.gen +
+        (cfg.candidate_env ? (int64_t)cfg.gen * 2 * cfg.repeat : 0) +
+        (cfg.mixed ? cfg.mixed_steps : 0);
+    if (decode_budget > INT_MAX ||
+        decode_budget * (cfg.spec ? 2 : 1) + (max_ctx > 0 ? max_ctx : 1) + CTX_MARGIN > INT_MAX) {
+        fprintf(stderr, BENCH ": requested context and generation budget are too large\n");
+        return 2;
+    }
     const int max_alloc = (max_ctx > 0 ? max_ctx : 1) +
-                          (cfg.warmup + cfg.gen + (cfg.candidate_env ? cfg.gen * 2 * cfg.repeat : 0)) * (cfg.spec ? 2 : 1) +
-                          (cfg.mixed ? cfg.mixed_steps : 0) + CTX_MARGIN;
+                          (int)decode_budget * (cfg.spec ? 2 : 1) + CTX_MARGIN;
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .backend = DS4_BACKEND_METAL,
@@ -1098,7 +1105,7 @@ int main(int argc, char **argv) {
         .corpus = &corpus,
         .eos = ds4_token_eos(engine),
         .vocab = ds4_engine_vocab_size(engine),
-            .spec = cfg.spec,
+        .spec = cfg.spec,
     };
 
     cfg.budget_bytes = session_budget_bytes(&cfg);

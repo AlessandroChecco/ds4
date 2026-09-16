@@ -36,6 +36,7 @@ Example:
 
 import argparse
 import json
+import math
 import random
 import statistics
 import sys
@@ -76,6 +77,9 @@ def post_stream(url, payload, timeout):
     )
     result.start = time.perf_counter()
     last = result.start
+    done = False
+    finish = None
+    counted = None
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             pending = b""
@@ -88,20 +92,20 @@ def post_stream(url, payload, timeout):
                         continue
                     data = line[5:].strip()
                     if data == b"[DONE]":
+                        done = True
                         continue
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
+                    chunk = json.loads(data)
+                    if chunk.get("error"):
+                        raise ValueError(str(chunk["error"]))
                     usage = chunk.get("usage")
                     if usage:
                         result.prompt_tokens = usage.get("prompt_tokens", 0)
-                        counted = usage.get("completion_tokens", 0)
-                        if counted:
-                            result.output_tokens = counted
+                        counted = usage.get("completion_tokens")
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
+                    if choices[0].get("finish_reason") is not None:
+                        finish = choices[0]["finish_reason"]
                     delta = choices[0].get("delta") or {}
                     text = delta.get("content") or delta.get("reasoning_content")
                     if not text:
@@ -112,17 +116,20 @@ def post_stream(url, payload, timeout):
                     else:
                         result.itl.append(now - last)
                     last = now
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         result.error = str(exc)
         return result
 
     result.e2el = time.perf_counter() - result.start
-    # Without usage in the stream, the delta count is the best token estimate.
-    if not result.output_tokens:
-        result.output_tokens = len(result.itl) + (1 if result.ttft else 0)
-    result.ok = result.ttft > 0.0
-    if not result.ok and not result.error:
+    if not done or finish not in ("stop", "length"):
+        result.error = "incomplete or failed stream"
+    elif not isinstance(counted, int) or not 0 < counted <= payload["max_tokens"]:
+        result.error = "missing or invalid completion token count"
+    elif not result.ttft:
         result.error = "no tokens streamed"
+    else:
+        result.output_tokens = counted
+        result.ok = True
     return result
 
 
@@ -339,6 +346,10 @@ def main():
                         help="write the metrics to this file")
     parser.add_argument("--label", default=None)
     args = parser.parse_args()
+    if min(args.requests, args.concurrency, args.max_tokens) <= 0 or min(args.prompt_tokens, args.warmup) < 0:
+        parser.error("requests, concurrency and max-tokens must be positive; prompt-tokens and warmup cannot be negative")
+    if not math.isfinite(args.request_rate) or args.request_rate < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("request-rate must be finite and nonnegative; timeout must be finite and positive")
     args.prefix_nonce = "shared"
 
     url = args.base_url.rstrip("/") + "/v1/chat/completions"
@@ -403,7 +414,7 @@ def main():
             json.dump(stats, fp, indent=2)
         print(f"\nwrote {args.json_path}")
 
-    return 0 if stats["completed"] else 1
+    return 0 if stats["completed"] == args.requests and not stats["failed"] else 1
 
 
 if __name__ == "__main__":
