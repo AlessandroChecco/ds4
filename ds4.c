@@ -42301,7 +42301,7 @@ struct ds4_engine {
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
-    uint32_t qwen4_batch_cycles, qwen4_batch_spec_cycles;
+    uint32_t qwen4_batch_cycles, qwen4_batch_spec_cycles, qwen4_batch_width;
     /* Recurrent state for every slot of a layer in one tensor, so a batched
      * decode can advance all of its rows in a single dispatch instead of one
      * per session.  Sessions hold views into it and a slot index. */
@@ -78155,27 +78155,9 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
 #endif
 
 #ifdef DS4_HAS_QWEN4_METAL
-/* ------------------------------------------------------------------------
- * Native session batching for Qwen3.8.
- *
- * A decode step is dominated by reading weights, not by arithmetic: one token
- * walks 48 layers of dense projections plus eleven of five hundred experts,
- * and every row of a batch wants the same bytes.  So everything that only
- * reads weights runs once for the whole batch, and only the kernels that touch
- * a session's own state run per row: the delta-net recurrence, the attention
- * caches and their block index, and the PLE convolution history.
- *
- * This is the split GLM 5.3 already uses in
- * glm53_graph_encode_native_session_batch.  Qwen needs no new kernels for the
- * shared half, because every one of them already takes a row count: that is
- * how prefill chunks work, and a decode batch is the same shape with the rows
- * belonging to different sessions.
- *
- * The batch runs in the engine's shared arena, which is also why sharing is
- * required rather than merely helpful: the single-row kernels need this row's
- * slice of the transients beside this session's own caches, and a
- * shared-arena session graph is already exactly that.
- * --------------------------------------------------------------------- */
+/* Batch weight-only work in the shared arena while keeping each session's
+ * recurrence, attention caches and n-gram history independent. Row views
+ * let the single-session kernels consume slices of the shared transients. */
 
 enum { QWEN4_BATCH_MAX_ROWS = 64 };
 
@@ -78329,10 +78311,9 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
  * rather than compute, and the first trunk layer does not need them: the PLE
  * layer that does sits at trunk index one.  Reading them after that layer has
  * been submitted lets the wait overlap GPU work instead of preceding it. */
-static bool qwen4_batch_stage_ngrams(ds4_decode_item *items, int count,
+static bool qwen4_batch_stage_ngrams(int count,
                                      const ds4_model *m, ds4_qwen4_gpu_graph *g,
                                      const uint32_t *ids) {
-    (void)items;
     float *row = g->host_row;
     if (!qwen4_ngram_read(m, ids, (size_t)count * DS4_N_PLE_HEADS, row)) {
         fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
@@ -78505,12 +78486,9 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
               qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
               qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
               qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
-    static int rows_path = -1;
-    if (rows_path < 0) {
-        rows_path = getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
-                    getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
-                    (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
-    }
+    const bool rows_path = getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
+                           getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
+                           (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
     if (ok && rows_path) return qwen4_batch_attention_rows(count, rowg, g, m, l, il) &&
                                 qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
     /* Each row appends to its own KV and indexer caches at its own position,
@@ -78591,7 +78569,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
             ngrams_staged = true;
             ok = (getenv("DS4_QWEN4_NO_NGRAM_OVERLAP") != NULL ||
                   ds4_gpu_flush_commands() != 0) &&
-                 qwen4_batch_stage_ngrams(items, count, m, g, ple_ids);
+                 qwen4_batch_stage_ngrams(count, m, g, ple_ids);
             if (!ok) break;
         }
         if (ds4_qwen4_layer_is_ple(il)) {
@@ -78649,20 +78627,10 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     free(rowg);
     return ok;
 }
-/* Every member must already share the engine arena, because the single-row
- * kernels address it through that session's own graph.  Sessions carrying
- * images, steering, MTP state or a pending verify snapshot keep the ordered
- * fallback: those all add per-session work the batch does not encode. */
-/* ---- speculative decode batch --------------------------------------------
- *
- * Every session contributes its next token and, when the predictor left it
- * a draft for that token, the draft as a second row.  The dense work runs
- * once over all the rows; the recurrent and attention steps run per session
- * over its one or two rows with the single-session verify kernels, so a
- * session's own arithmetic (state snapshots included) is that of the C=1
- * speculative cycle.  Acceptance is greedy: a draft stands when it is the
- * target's argmax for its row.  The predictor then runs its layer per
- * session over the committed rows and every session's head as one product. */
+/* Each session contributes its next token and optionally one draft. State
+ * snapshots retain the first row for rejection; a draft is accepted only
+ * when it is the target's argmax. Grouped reductions can round differently
+ * from a single-session verification. */
 
 typedef struct {
     ds4_session *session;
@@ -78761,7 +78729,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         if (!ngrams_staged && ds4_qwen4_layer_is_ple(il)) {
             ngrams_staged = true;
             ok = (getenv("DS4_QWEN4_NO_NGRAM_OVERLAP") != NULL || ds4_gpu_flush_commands() != 0) &&
-                 qwen4_batch_stage_ngrams(NULL, (int)N, m, g, ple_ids);
+                 qwen4_batch_stage_ngrams((int)N, m, g, ple_ids);
             if (!ok) break;
         }
         if (ds4_qwen4_layer_is_ple(il)) {
@@ -78967,7 +78935,7 @@ static bool qwen4_graph_native_session_batch_check(ds4_decode_item *items, int c
     const char *env = getenv("DS4_QWEN4_SESSION_BATCH");
     if ((env && env[0] && strcmp(env, "0") == 0) ||
         count < 2 || count > QWEN4_BATCH_MAX_ROWS ||
-        !e->qwen4_shared_workspace || (e->glm_mtp && !speculative)) {
+        !e->qwen4_shared_workspace) {
         return false;
     }
     const ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
@@ -78987,7 +78955,7 @@ static bool qwen4_graph_native_session_batch_check(ds4_decode_item *items, int c
             g->owns_scratch || g->R != arena->R ||
             g->n_block_cap > arena->n_block_cap ||
             g->pos != (uint32_t)s->checkpoint.len ||
-            g->vis_span_count != 0 || (g->mtp_R != NULL) != speculative ||
+            g->vis_span_count != 0 || (speculative && !g->mtp_R) ||
             g->snap_after_first || g->snap_after_second ||
             g->steer_attn_scale != 0.0f || g->steer_ffn_scale != 0.0f ||
             g->dump_prompt_rows) {
@@ -79433,13 +79401,6 @@ static int ds4_sessions_eval_batch_native(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
-    /* DS4_BATCH_PHASES=1 splits a batched step (any model) into the host's
-     * encode and the wait for the GPU, taking no synchronization of its own:
-     * it is the only way to tell whether shaving dispatches buys host time or
-     * GPU time, which decides whether batching more of them is worth it. */
-    static int phases = -1;
-    if (phases < 0) phases = getenv("DS4_BATCH_PHASES") != NULL;
-    const double t_batch_begin = phases ? now_sec() : 0.0;
     bool ok = ds4_gpu_begin_commands() != 0;
     const bool native_ds41 = ds4_session_is_ds41(items[0].session);
     const uint32_t prefill_rows = prefill ?
@@ -79449,8 +79410,10 @@ static int ds4_sessions_eval_batch_native(
 #ifdef DS4_HAS_QWEN4_METAL
     const bool native_qwen4 = ok && !prefill &&
         ds4_session_is_qwen4(items[0].session);
+#else
+    const bool native_qwen4 = false;
 #endif
-    const bool native_shared = ok && !native_ds41 && !native_glm53 &&
+    const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
     const bool native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
@@ -79507,20 +79470,8 @@ static int ds4_sessions_eval_batch_native(
             }
         }
     }
-    const double t_encoded = phases ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (phases) {
-        static double acc_encode, acc_gpu;
-        static unsigned n_calls;
-        acc_encode += t_encoded - t_batch_begin;
-        acc_gpu += now_sec() - t_encoded;
-        if (++n_calls % 16u == 0u) {
-            fprintf(stderr, "ds4: batch phases avg ms: encode %.2f gpu_wait %.2f\n",
-                    1e3 * acc_encode / 16.0, 1e3 * acc_gpu / 16.0);
-            acc_encode = acc_gpu = 0.0;
-        }
-    }
-    else (void)ds4_gpu_synchronize();
+    /* Finish partial command buffers before invalidating failed sessions. */
+    if (!ds4_gpu_end_commands()) ok = false;
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
 #endif
@@ -79544,7 +79495,12 @@ static int ds4_sessions_eval_batch_native(
                                      (uint64_t)i * DS4_N_VOCAB * sizeof(float),
                                      s->logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-            if (ok) s->qwen4_graph.pos++;
+            if (ok) {
+                s->qwen4_graph.pos++;
+                s->qwen4_rewound = false;
+                s->glm_mtp_have = 0;
+                s->glm_mtp_have2 = false;
+            }
             continue;
         }
 #endif
@@ -79607,11 +79563,13 @@ static int ds4_sessions_eval_batch_native(
     if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: %s session batch rows=%d prefill_rows=%u family=%s "
-                "native_ds41=%d native_glm53=%d native_shared=%d native_qkv=%d\n",
+                "native_ds41=%d native_glm53=%d native_qwen4=%d native_shared=%d native_qkv=%d\n",
                 ds4_backend_name(e->backend), count, prefill_rows,
-                ds4_session_is_glm(items[0].session) ? "glm" : "deepseek",
+                ds4_session_is_glm(items[0].session) ? "glm" :
+                ds4_session_is_qwen4(items[0].session) ? "qwen" : "deepseek",
                 native_ds41 ? 1 : 0,
                 native_glm53 ? 1 : 0,
+                native_qwen4 ? 1 : 0,
                 native_shared ? 1 : 0,
                 native_qkv ? 1 : 0);
     }
@@ -79886,20 +79844,9 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         size_t errlen);
 
 #ifdef DS4_HAS_QWEN4_METAL
-/* Whether the next batched cycle should carry drafts.  A draft row is worth
- * its cost only for the batch as a whole: the seventeenth row opens a second
- * tile of every dense projection, so rows past it are nearly free and a
- * batch speculates for every stream or for none.  It pays when
- * (1 + p) c_plain > c_spec, with p the drafts' acceptance and the two
- * cycle times measured on this engine (a plain cycle 80 ms, a speculative
- * one 149 ms at sixteen streams: code at p = 0.94 gains, prose at 0.62
- * loses).  The engine starts by drafting for eight cycles and running
- * two plain ones, which prices both kinds; from then on the other kind gets
- * a two-cycle probe, every thirty-two cycles while plain (the text may turn
- * predictable) and every hundred and twenty-eight while speculating (only
- * the plain cost can drift), so a stale p or cost cannot hold the decision.
- * A cycle that switches kind (drafts in and none out, or the reverse)
- * prices neither. */
+/* Speculate when (1 + acceptance) * plain_cost > speculative_cost. Probe
+ * both schedules periodically so changes in text or GPU speed can reverse
+ * the decision. Transition cycles do not update either timing estimate. */
 static float qwen4_ema(float avg, float sample, uint32_t n_prior) {
     return avg + (sample - avg) / (n_prior < 15u ? (float)(n_prior + 1u) : 16.0f);
 }
@@ -79949,6 +79896,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         const ds4_weights *w = &e->weights;
         const uint32_t V = DS4_N_VOCAB;
         const double t0 = now_sec();
+        if (e->qwen4_batch_width != (uint32_t)count) {
+            e->qwen4_batch_width = (uint32_t)count;
+            e->qwen4_batch_cycles = e->qwen4_batch_spec_cycles = 0;
+            e->qwen4_batch_p = e->qwen4_batch_ms[0] = e->qwen4_batch_ms[1] = 0;
+        }
         qwen4_batch_member mem[16];
         uint32_t pos0[16], committed[16];
         int parents[16], drafts[16];
@@ -79961,12 +79913,14 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             mem[i].n = 1u;
             mem[i].row0 = N;
             pos0[i] = g->pos;
-            if (s->glm_mtp_have && s->glm_mtp_parent == items[i].token && g->pos + 2u <= g->ctx_cap &&
+            /* The logit rows below replace those paired with older snapshots. */
+            g->snap_valid = g->snap2_valid = g->snap0_valid = false;
+            if (s->glm_mtp_have && s->glm_mtp_parent == items[i].token &&
+                s->ctx_size - s->checkpoint.len >= 2 && g->pos + 2u <= g->ctx_cap &&
                 g->snap_ple_hist && g->mtp_R) {
                 mem[i].tokens[1] = s->glm_mtp_draft;
                 mem[i].n = 2u;
                 g->snap_after_first = true;
-                g->snap_valid = false;
             }
             s->glm_mtp_have = 0;
             s->glm_mtp_have2 = false;
