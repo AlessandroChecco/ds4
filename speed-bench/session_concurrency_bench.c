@@ -1041,8 +1041,13 @@ int main(int argc, char **argv) {
         write_csv(cfg.csv_path, ds4_engine_model_name(engine), cells, n);
     }
 
+    bool failed = false;
+    for (int i = 0; i < n; i++) {
+        if (!cells[i].oom && !cells[i].ran) failed = true;
+        if (cfg.verify && !cells[i].verify_ok) failed = true;
+    }
     free(cells);
     ds4_tokens_free(&corpus);
     ds4_engine_close(engine);
-    return 0;
+    return failed ? 1 : 0;
 }

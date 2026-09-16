@@ -58110,16 +58110,7 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap_after_second = false;
 }
 
-/* rows > 0 limits the product to the leading rows of w (a contiguous prefix
- * of the weight buffer); the per-row arithmetic is unchanged. */
-static uint32_t qwen4_env_threshold(const char *name, uint32_t fallback) {
-    const char *env = getenv(name);
-    if (!env || !env[0]) return fallback;
-    char *end = NULL;
-    const unsigned long v = strtoul(env, &end, 10);
-    return (end != env && *end == '\0' && v <= 65536ul) ? (uint32_t)v : fallback;
-}
-
+/* rows > 0 limits the product to a contiguous leading prefix of w. */
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t rows) {
     const uint64_t in_dim = w->dim[0], full_dim = w->ndim >= 2 ? w->dim[1] : 1u;
@@ -58133,39 +58124,13 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
 #else
 
-    /* Two separate reasons to leave the per-type dense paths below, which read
-     * the weight matrix once per token.
-     *
-     * A prefill chunk fills the tiled GEMM's 32-token tiles, so reading each
-     * weight once per tile is simply cheaper; the threshold is that tile
-     * height, not the eight rows the path was originally tuned with, because
-     * below a full tile the trade inverts.
-     *
-     * A decode batch never fills a tile, and there the tiled path wins where
-     * the projection is too narrow to give the per-token kernel any
-     * parallelism, because the k-split spreads its grid over the machine:
-     * the hyper-connection down projections, 10240 wide and 320 tall, are 96
-     * of the calls in a step, and the F32 router and gate projections are
-     * another 120.  Q8 weights stay on the per-token kernel at every decode
-     * width: it reads the matrix once per four tokens, yet still beats the
-     * tile by 5% at sixteen rows.
-     *
-     * DS4_QWEN4_DENSE_MM_LEGACY restores the original policy for measurement. */
+    /* Small F16 batches use float operands. Two/three-row verification and
+     * large prefills retain their existing kernels. The legacy switch is an
+     * arithmetic/performance control, not a user tuning option. */
     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
-    const uint32_t mm_min = legacy ? 8u : qwen4_env_threshold("DS4_QWEN4_DENSE_MM_MIN", 8u);
-    /* F16 decode batches take the tile at any width: the generic F16 tile
-     * they would otherwise reach stages the activations as halves, and the
-     * hyper-connection up projections carried that rounding into the
-     * logits.  The tile costs the same and keeps float operands.  Verify
-     * rows (two or three tokens) stay on the few-row matvec: the tile costs
-     * them three times more, and it is their original path.  Prefill chunks
-     * keep the generic tile, their original path too: it is faster there
-     * (1410 vs 1305 tok/s), and a single stream's tokens stay those of the
-     * reference. */
     const bool f16_batch = !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
-        n_tok <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_F16_MAX", 64u) &&
-        (out_dim <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_NARROW_ROWS", 512u) || n_tok > 8u);
-    if (((n_tok > mm_min && w->type == DS4_TENSOR_F32) || f16_batch) &&
+        n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
+    if (((n_tok > 8u && w->type == DS4_TENSOR_F32) || f16_batch) &&
         (in_dim % 32) == 0) {
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
                                            (uint32_t)in_dim, (uint32_t)out_dim);
@@ -58304,7 +58269,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
-    if (T > qwen4_env_threshold("DS4_QWEN4_HC_MIX_GEMM_MIN", 8u) &&
+    if (T > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
@@ -58548,7 +58513,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * choices each over 512 experts, so an expert averages a third of a token
      * and the tiles run nearly empty.  Above this row count the GEMM wins;
      * below it the per-token expert path does, by 4% at sixteen rows. */
-    const bool mm = T > qwen4_env_threshold("DS4_QWEN4_MOE_MM_MIN", 64u) &&
+#ifdef DS4_HAS_QWEN4_METAL
+    const uint32_t mm_min = 64u;
+#else
+    const uint32_t mm_min = 8u;
+#endif
+    const bool mm = T > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
@@ -58594,11 +58564,14 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     /* A decode batch runs the shared expert as dense projections over its
      * rows, as the prefill path does: as a slot of the per-token kernels it
      * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
-     * verify rows keep the slot.  DS4_QWEN4_MOE_SHARED_DENSE_MIN raises the
-     * width for A/B. */
-    const bool shared_dense = T > qwen4_env_threshold("DS4_QWEN4_MOE_SHARED_DENSE_MIN", 8u) &&
+     * verify rows keep the slot. */
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool shared_dense = T > 8u &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
+#else
+    const bool shared_dense = false;
+#endif
     if (ok && shared_dense) {
         ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
              qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
@@ -58609,6 +58582,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * ones: the grouped kernels read every expert once per four rows that
      * chose it instead of once per row, each row's arithmetic unchanged.
      * DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
+#ifdef DS4_HAS_QWEN4_METAL
     const bool grouped = shared_dense && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
         getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
@@ -58623,7 +58597,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    g->cap_tokens, m->map, m->size, l->ffn_down_exps->abs_offset,
                                                    l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
-    } else if (ok) {
+    } else
+#endif
+    if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,

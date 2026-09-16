@@ -11533,6 +11533,7 @@ int ds4_gpu_synchronize(void) {
 }
 
 static void qwen4_nax_release_scratch(void);
+static void qwen4_batch_release_scratch(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
@@ -11823,6 +11824,7 @@ void ds4_gpu_cleanup(void) {
         g_model_mapped_size = 0;
         g_model_mapped_max_tensor_bytes = 0;
         qwen4_nax_release_scratch();
+        qwen4_batch_release_scratch();
         ds4_gpu_tensor_tracking_reset();
         g_flash_attn_mask_bytes = 0;
         g_flash_attn_zero_mask_bytes = 0;
@@ -50105,6 +50107,14 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
 
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
 static uint64_t g_qwen4_dense_mm_partials_bytes;
+
+static void qwen4_batch_release_scratch(void) {
+    ds4_gpu_tensor_free(g_qwen4_dense_mm_partials);
+    ds4_gpu_tensor_free(g_qwen4_gdn_slots);
+    g_qwen4_dense_mm_partials = g_qwen4_gdn_slots = NULL;
+    g_qwen4_dense_mm_partials_bytes = 0;
+    for (unsigned i = 0; i < QWEN4_K_COUNT; i++) g_qwen4_pipelines[i] = nil;
+}
 
 /* Scratch for the k-split planes, allocated once and generously: the
  * command buffer holds unretained references, so a scratch replaced while
