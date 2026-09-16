@@ -78968,6 +78968,13 @@ static bool qwen4_graph_native_session_batch_check(ds4_decode_item *items, int c
     }
     const ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
     if (arena->cap_tokens < (uint32_t)count) return false;
+    if (speculative) {
+        const uint64_t rows = 2u * (uint32_t)count;
+        const uint64_t projection = rows * (DS4_N_HC + 1u) * DS4_N_EMBD * sizeof(float);
+        if (rows > arena->cap_tokens ||
+            ds4_gpu_tensor_bytes(arena->mid) < projection ||
+            ds4_gpu_tensor_bytes(arena->part) < 2u * projection) return false;
+    }
     for (int i = 0; i < count; i++) {
         const ds4_session *s = items[i].session;
         const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
@@ -79898,7 +79905,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                 return 1;
             }
         }
-        if (s->checkpoint.len + 2 > s->ctx_size) {
+        if (s->checkpoint.len >= s->ctx_size) {
             if (err && errlen) snprintf(err, errlen, "decode batch item %d reached its context limit", i);
             return 1;
         }
@@ -79936,7 +79943,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
         bool ok = ds4_gpu_begin_commands() != 0 &&
                   qwen4_graph_encode_native_session_batch_ragged(mem, count, N, arena, m, w);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (!ds4_gpu_end_commands()) ok = false;
         for (int i = 0; i < count; i++) {
             ds4_qwen4_gpu_graph *g = &items[i].session->qwen4_graph;
             if (g->snap_after_first) {
@@ -80001,8 +80008,13 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         for (int i = 0; i < count; i++) {
             if (items[i].session->qwen4_graph.pos + 2u > items[i].session->qwen4_graph.ctx_cap) room = false;
         }
-        if (room && getenv("DS4_QWEN4_NO_BATCH_DRAFT") == NULL &&
-            qwen4_batch_mtp_drafts(mem, count, committed, parents, pos0, N, arena, m, w, drafts)) {
+        if (room && getenv("DS4_QWEN4_NO_BATCH_DRAFT") == NULL) {
+            if (!qwen4_batch_mtp_drafts(mem, count, committed, parents, pos0, N, arena, m, w, drafts)) {
+                (void)ds4_gpu_end_commands();
+                for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+                if (err && errlen) snprintf(err, errlen, "metal speculative batch: predictor failed");
+                return 1;
+            }
             for (int i = 0; i < count; i++) {
                 ds4_session *s = items[i].session;
                 s->glm_mtp_draft = drafts[i];
@@ -80016,7 +80028,8 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
     /* Sequential fallback: one speculative cycle per session. */
     for (int i = 0; i < count; i++) {
         int toks[3];
-        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, 2, -1,
+        const int room = items[i].session->ctx_size - items[i].session->checkpoint.len;
+        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, room < 2 ? room : 2, -1,
                                                           toks, 2, err, errlen);
         if (n <= 0) {
             for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
