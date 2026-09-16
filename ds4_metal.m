@@ -48782,7 +48782,7 @@ int ds4_gpu_qwen4_gdn_scan_rows_tensor(
     }
     /* Simd groups own independent value rows, so their grouping changes the
      * dispatch shape without touching a row's recurrent arithmetic. */
-    const uint32_t nsg = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_BATCH_GDN_NSG", 1u, 1u, 8u);
+    const uint32_t nsg = 1u;
     return qwen4_dispatch(QWEN4_K_GDN_SCAN_ROWS, &args, sizeof(args), b, 6,
                           MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, n_rows),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -50269,14 +50269,7 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     uint32_t n_split = 1u;
     if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
         const uint32_t nk = (in_dim + 31u) / 32u;
-        /* The worst logit difference against the unsplit path falls as the
-         * split widens, as more and shorter accumulations should: 2.5e-3 at
-         * two splits, 8.4e-4 at thirteen.  Wider splits once looked wrong
-         * (a jump to 1.3): that was the scratch below being reallocated
-         * under a command buffer that still referenced it, not the split.
-         * Splits of 32 and 64 measure exact now and no faster, so the
-         * default stays. */
-        const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_KSPLIT_TILES", 128u, 1u, 4096u);
+        const uint32_t target = 128u;
         const uint32_t want = threadgroups >= target ? 1u : (target + threadgroups - 1u) / threadgroups;
         n_split = want > nk / 4u ? (nk / 4u ? nk / 4u : 1u) : want;
         if (n_split > 64u) n_split = 64u;
@@ -50320,7 +50313,7 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
     const uint32_t simdgroups = out_rows / 32u;
     /* enough simdgroups to cover the machine several times over, no split
      * shorter than four blocks */
-    const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_BATCH_MM_SIMDGROUPS", 640u, 32u, 8192u);
+    const uint32_t target = 640u;
     uint32_t n_split = simdgroups >= target ? 1u : (target + simdgroups - 1u) / simdgroups;
     if (n_split > nk / 4u) n_split = nk / 4u ? nk / 4u : 1u;
     if (n_split > 16u) n_split = 16u;
